@@ -1,0 +1,24 @@
+# Feast project configuration — training feature store
+#
+# Offline store : DuckDB
+#   DuckDBDeltaEngine (duckdb_engine.py) initialises the DuckDB connection
+#   with the ``httpfs`` and ``delta`` extensions, enabling delta_scan()
+#   queries against Delta Lake tables on MinIO.
+#
+# Online store : Redis
+#   Used by materialize_incremental() (apply.py) to push feature values from
+#   Delta Lake into Redis so the inference pipeline can serve them at low latency.
+#   Connection string matches the mlops-redis container in docker-compose.yml.
+
+project: movielens_mlops
+registry: registry.db
+provider: local
+
+offline_store:
+    type: duckdb
+
+online_store:
+    type: redis
+    connection_string: "localhost:6379"
+
+entity_key_serialization_version: 2
