@@ -31,10 +31,15 @@ class BaseConsumer(ABC):
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         continue
                     raise KafkaException(msg.error())
-                self.process(json.loads(msg.value().decode("utf-8")))
+                self.process(json.loads(msg.value().decode("utf-8")), msg.topic())
         finally:
+            self.shutdown()
             self._consumer.close()
 
     @abstractmethod
-    def process(self, message: dict) -> None:
+    def process(self, message: dict, topic: str) -> None:
         """Handle a single decoded message."""
+
+    def shutdown(self) -> None:
+        """Called gracefully on consumer exit."""
+        pass

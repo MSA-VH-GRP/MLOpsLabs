@@ -11,11 +11,14 @@ REPLICATION="${KAFKA_REPLICATION_FACTOR:-1}"
 TOPICS=(
   "raw-events"
   "processed-events"
+  "new-user"
+  "new-movie"
+  "new-rating"
 )
 
 for topic in "${TOPICS[@]}"; do
   echo "Creating topic: $topic"
-  docker exec mlops-kafka kafka-topics.sh \
+  docker exec mlops-kafka /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server "$BROKER" \
     --create \
     --if-not-exists \

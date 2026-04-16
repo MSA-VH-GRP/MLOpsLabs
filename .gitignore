@@ -222,3 +222,7 @@ _delta_log/
 
 # Jupyter outputs
 notebooks/**/.ipynb_checkpoints
+
+# Dataset files
+data/ml-1m/
+data/ml-1m.zip
