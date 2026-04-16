@@ -1,0 +1,21 @@
+project: mlops_project
+provider: local
+
+registry:
+  registry_type: file
+  path: feast/registry/registry.db   # DuckDB file; bind-mounted into api container
+
+online_store:
+  type: redis
+  connection_string: "redis:6379"    # Hostname inside Docker network
+
+offline_store:
+  type: file                         # Parquet staging area in MinIO
+  # Delta Lake tables are written by the ingest pipeline to s3://offline-store/delta/
+  # materialization.py converts Delta → Parquet into s3://offline-store/parquet/
+  # Feast FileSource then reads those Parquet files for materialization into Redis.
+
+entity_key_serialization_version: 2
+
+flags:
+  sdk_overwrite_online_stores_with_push_sources: true
