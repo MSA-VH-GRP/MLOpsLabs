@@ -17,9 +17,15 @@ Covers data ingestion, feature engineering, model training, serving, and observa
                         ┌─────────────────────────────────────────────┐
                         │           Offline Store (MinIO)              │
                         │  s3://offline-store/delta/   (Delta Lake)    │
-                        │  s3://offline-store/parquet/ (Feast staging) │
                         └──────────────────────┬──────────────────────┘
-                                               │ Feast Materialization
+                                               │ deltalake → PyArrow
+                                               ▼
+                        ┌─────────────────────────────────────────────┐
+                        │     DuckDB (in-memory, staging engine)       │
+                        │  SQL transforms + httpfs COPY TO S3          │
+                        │  s3://offline-store/parquet/ (staged.parquet)│
+                        └──────────────────────┬──────────────────────┘
+                                               │ Feast DuckDB offline store
                                                ▼
                         ┌─────────────────────────────────────────────┐
                         │        Online Store (Redis)                  │
@@ -54,8 +60,8 @@ Covers data ingestion, feature engineering, model training, serving, and observa
 |---|---|---|
 | **Data Ingestion** | Apache Kafka 4.2 (KRaft) | Event streaming into the pipeline |
 | **Raw Storage** | MinIO (S3-compatible) | Raw data landing zone (`raw-data` bucket) |
-| **Offline Store** | MinIO + Delta Lake | ACID feature tables (`offline-store` bucket) |
-| **Feature Store** | Feast + DuckDB | Feature registry, serving definitions |
+| **Offline Store** | MinIO + Delta Lake + DuckDB | Delta Lake tables; DuckDB stages Parquet for Feast |
+| **Feature Store** | Feast + DuckDB | DuckDB offline store, DuckDB registry, Redis online store |
 | **Online Store** | Redis 8 | Low-latency feature serving + cache |
 | **Model Registry** | MLflow 3.1 | Experiment tracking, model versioning |
 | **Inference API** | FastAPI + Uvicorn | `/ingest`, `/train`, `/predict`, `/health` |
@@ -91,7 +97,7 @@ MLOpsLabs/
 │   │
 │   ├── features/
 │   │   ├── transformations.py  # Pure feature transform functions
-│   │   └── materialization.py  # Delta → Parquet → Feast → Redis
+│   │   └── materialization.py  # Delta → DuckDB staging → Parquet → Feast → Redis
 │   │
 │   ├── models/
 │   │   ├── trainer.py          # Train loop + MLflow autolog
@@ -105,7 +111,7 @@ MLOpsLabs/
 │       └── kafka_producer.py   # Kafka producer wrapper
 │
 ├── feast/
-│   ├── feature_store.yaml      # DuckDB registry + Redis online store
+│   ├── feature_store.yaml      # DuckDB offline store + DuckDB registry + Redis online store
 │   ├── registry/               # DuckDB registry file (gitignored)
 │   └── feature_views/
 │       ├── raw_features.py     # Entity, FileSource, FeatureView
@@ -261,8 +267,9 @@ Fetches features from Redis (Feast), runs inference with an MLflow model.
 ```
 1. POST /ingest  →  Kafka (raw-events topic)
 2. IngestPipeline (consumer)  →  Delta Lake on MinIO (offline-store/delta/)
-3. materialization.py  →  Delta → Parquet (offline-store/parquet/)
-4. feast materialize  →  Parquet → Redis (online store)
+3. materialization.py  →  Delta → DuckDB (in-memory, SQL transforms)
+4. DuckDB httpfs        →  staged Parquet (offline-store/parquet/staged.parquet)
+5. feast materialize   →  Feast DuckDB offline store → Redis (online store)
 5. POST /predict  →  Redis features + MLflow model → prediction
 ```
 
@@ -271,7 +278,7 @@ Fetches features from Redis (Feast), runs inference with an MLflow model.
 | Bucket | Contents |
 |---|---|
 | `raw-data` | Raw uploaded files / objects |
-| `offline-store` | Delta Lake tables + Parquet staging for Feast |
+| `offline-store` | Delta Lake tables (`delta/`) + DuckDB-staged Parquet (`parquet/`) for Feast |
 | `mlflow-artifacts` | MLflow models, plots, metrics |
 
 ---
@@ -288,9 +295,70 @@ bash scripts/feast_apply.sh
 feast -c feast/ apply
 ```
 
-Run materialization (Delta → Parquet → Redis):
+Run materialization (Delta → DuckDB staging → Parquet → Redis):
 ```bash
 python -m src.features.materialization
+```
+
+---
+
+## DuckDB Offline Store
+
+DuckDB acts as the **staging engine** between Delta Lake (raw storage) and the Feast offline store. It replaces a plain file/Parquet copy with an in-memory SQL transformation layer.
+
+### How it works
+
+```
+Delta Lake (MinIO)
+  └─ deltalake → PyArrow
+        └─ DuckDB register_delta_as_table()
+              └─ SQL transforms (STAGING_SQL in materialization.py)
+                    └─ DuckDB httpfs COPY TO S3
+                          └─ staged.parquet (MinIO)
+                                └─ Feast DuckDB offline store
+                                      └─ feast materialize → Redis
+```
+
+### Key components
+
+| File | Role |
+|---|---|
+| `src/core/duckdb_client.py` | DuckDB connection factory — installs `httpfs`, configures MinIO S3 credentials |
+| `src/features/materialization.py` | Orchestrates the full pipeline; contains `STAGING_SQL` for feature transforms |
+| `feast/feature_store.yaml` | `offline_store.type: duckdb` — Feast uses DuckDB to query staged Parquet |
+| `feast/feature_views/raw_features.py` | `FileSource` points to `s3://offline-store/parquet/raw_events/staged.parquet` |
+
+### Adding feature transforms
+
+Edit `STAGING_SQL` in `src/features/materialization.py`:
+
+```python
+STAGING_SQL = """
+    SELECT
+        event_id,
+        event_timestamp,
+        CAST(json_extract(payload, '$.feature_1') AS FLOAT) AS feature_1,
+        CAST(json_extract(payload, '$.feature_2') AS FLOAT) AS feature_2,
+        -- add derived features here, e.g.:
+        feature_1 / NULLIF(feature_2, 0)                   AS ratio,
+        date_diff('hour', event_timestamp, NOW())           AS hours_since_event
+    FROM raw_events
+    WHERE event_timestamp IS NOT NULL
+"""
+```
+
+### Using DuckDB directly (ad-hoc queries)
+
+```python
+from src.core.duckdb_client import get_duckdb_connection
+
+conn = get_duckdb_connection()
+df = conn.execute("""
+    SELECT * FROM read_parquet('s3://offline-store/parquet/raw_events/staged.parquet')
+    LIMIT 10
+""").df()
+print(df)
+conn.close()
 ```
 
 ---
