@@ -1,17 +1,28 @@
-"""POST /predict — fetch features from Redis, run inference, cache result."""
+"""
+POST /predict          — generic sklearn model inference via Feast + MLflow
+POST /predict/mamba    — Mamba4Rec sequential recommendation
+"""
 
 import time
 
 import mlflow
+import pandas as pd
 from fastapi import APIRouter, Depends
 from feast import FeatureStore
 
 from src.api.dependencies import get_feature_store
-from src.api.schemas.predict import PredictRequest, PredictResponse
+from src.api.schemas.predict import (
+    Mamba4RecPredictRequest,
+    Mamba4RecPredictResponse,
+    PredictRequest,
+    PredictResponse,
+)
 from src.core.config import settings
 
 router = APIRouter()
 
+
+# ── Generic sklearn predict (unchanged) ───────────────────────────────────────
 
 @router.post("/predict", response_model=PredictResponse)
 async def predict(
@@ -33,14 +44,50 @@ async def predict(
     model = mlflow.pyfunc.load_model(model_uri)
 
     # Run inference
-    import pandas as pd
     df = pd.DataFrame(feature_vector)
     raw_preds = model.predict(df)
-    predictions = [{"entity_id": eid, "prediction": pred} for eid, pred in zip(request.entity_ids, raw_preds)]
+    predictions = [
+        {"entity_id": eid, "prediction": pred}
+        for eid, pred in zip(request.entity_ids, raw_preds)
+    ]
 
     latency_ms = (time.perf_counter() - t0) * 1000
     return PredictResponse(
         predictions=predictions,
+        model_version=request.model_alias,
+        latency_ms=round(latency_ms, 2),
+    )
+
+
+# ── Mamba4Rec sequential recommendation ───────────────────────────────────────
+
+@router.post("/predict/mamba", response_model=Mamba4RecPredictResponse)
+async def predict_mamba(request: Mamba4RecPredictRequest):
+    """
+    Sequential movie recommendation using the trained Mamba4Rec model.
+
+    The predictor is loaded from MLflow on first call and cached in memory.
+    Subsequent calls reuse the cached instance for low-latency serving.
+    """
+    from src.inference.mamba_predictor import get_predictor
+
+    t0 = time.perf_counter()
+
+    predictor = get_predictor(request.model_name, request.model_alias)
+
+    recommendations = predictor.recommend(
+        item_history=request.item_history,
+        time_history=request.time_history,
+        age_idx=request.age_idx,
+        gender_idx=request.gender_idx,
+        occupation=request.occupation,
+        top_k=request.top_k,
+        target_time=request.target_time,
+    )
+
+    latency_ms = (time.perf_counter() - t0) * 1000
+    return Mamba4RecPredictResponse(
+        recommendations=recommendations,
         model_version=request.model_alias,
         latency_ms=round(latency_ms, 2),
     )
