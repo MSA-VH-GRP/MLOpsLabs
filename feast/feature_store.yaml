@@ -1,0 +1,29 @@
+project: mlops_project
+provider: local
+
+registry:
+  registry_type: file
+  path: feast/registry/registry.db   # DuckDB file; bind-mounted into api container
+
+online_store:
+  type: redis
+  connection_string: "redis:6379"    # Hostname inside Docker network
+
+offline_store:
+  type: duckdb
+  # DuckDB is used as the staging engine for the offline store.
+  #
+  # Data flow:
+  #   Kafka consumer → Delta Lake (s3://offline-store/delta/)
+  #       → DuckDB reads Delta via PyArrow, applies SQL transforms
+  #       → DuckDB writes staged Parquet (s3://offline-store/parquet/)
+  #       → Feast DuckDB offline store queries Parquet via httpfs
+  #       → feast materialize → Redis online store
+  #
+  # S3/MinIO credentials are injected via environment variables at runtime:
+  #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL
+
+entity_key_serialization_version: 2
+
+flags:
+  sdk_overwrite_online_stores_with_push_sources: true

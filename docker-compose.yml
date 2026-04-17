@@ -1,5 +1,5 @@
 # MLOps Infrastructure Stack
-# Apache Kafka | MinIO | Redis
+# Apache Kafka | MinIO | Redis | MLflow | FastAPI | Prometheus | Grafana
 #
 # Usage:
 #   docker compose up -d          # Start all services
@@ -18,7 +18,7 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
@@ -33,7 +33,7 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
       interval: 15s
       timeout: 10s
       retries: 5
@@ -53,6 +53,7 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
     volumes:
       - minio_data:/data
     healthcheck:
@@ -64,7 +65,29 @@ services:
     networks:
       - mlops-network
 
-  # ─── Redis (caching & message broker) ───
+  # ─── MinIO bucket initializer (one-shot) ───
+  minio-init:
+    image: minio/mc:RELEASE.2025-05-21T01-59-54Z
+    container_name: mlops-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+        mc mb --ignore-existing local/raw-data;
+        mc mb --ignore-existing local/offline-store;
+        mc mb --ignore-existing local/mlflow-artifacts;
+        echo 'MinIO buckets initialized.';
+      "
+    networks:
+      - mlops-network
+    restart: "no"
+
+  # ─── Redis (online store & cache) ───
   redis:
     image: redis:8.6.2
     container_name: mlops-redis
@@ -90,12 +113,189 @@ services:
     networks:
       - mlops-network
 
+  # ─── MLflow (model registry + experiment tracking) ───
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.1.0
+    container_name: mlops-mlflow
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - mlflow_data:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root s3://mlflow-artifacts/
+      --host 0.0.0.0
+      --port 5000
+      --serve-artifacts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
+  # ─── Redis Exporter (Prometheus metrics for Redis) ───
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.74.0
+    container_name: mlops-redis-exporter
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "9121:9121"
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
+  # ─── Kafka Exporter (Prometheus metrics for Kafka) ───
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: mlops-kafka-exporter
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9308:9308"
+    command:
+      - "--kafka.server=kafka:9092"
+      - "--web.listen-address=:9308"
+    healthcheck:
+      test: ["CMD-SHELL", "echo 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
+  # ─── Prometheus (metrics collection) ───
+  prometheus:
+    image: prom/prometheus:v3.3.1
+    container_name: mlops-prometheus
+    depends_on:
+      - redis-exporter
+      - kafka-exporter
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
+  # ─── Grafana (dashboards & visualization) ───
+  grafana:
+    image: grafana/grafana:12.0.1
+    container_name: mlops-grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
+  # ─── FastAPI (inference serving + training trigger) ───
+  api:
+    build:
+      context: .
+      dockerfile: src/api/Dockerfile
+    container_name: mlops-api
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      # MinIO / S3
+      MINIO_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      # MLflow
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      # Redis
+      REDIS_URL: redis://redis:6379
+      # Kafka
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_INGEST_TOPIC: ${KAFKA_INGEST_TOPIC:-raw-events}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-mlops-consumer-group}
+      # App
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-default}
+    volumes:
+      - ./feast:/app/feast:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
 volumes:
   kafka_data:
     driver: local
   minio_data:
     driver: local
   redis_data:
+    driver: local
+  mlflow_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
     driver: local
 
 networks:
