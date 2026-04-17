@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from src.api.schemas.ingest import IngestRequest, IngestResponse
 from src.core.config import settings
-from src.core.kafka_producer import produce
+from src.core.kafka_producer import flush, produce
 
 router = APIRouter()
 
@@ -17,4 +17,5 @@ async def ingest(request: IngestRequest):
             key=event.id,
             value={"id": event.id, "timestamp": event.timestamp, "payload": event.payload},
         )
+    flush()  # single network round-trip for the whole batch
     return IngestResponse(accepted=len(request.events), topic=settings.kafka_ingest_topic)

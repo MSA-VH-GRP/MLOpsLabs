@@ -33,15 +33,27 @@ def run_training(
 
     store = FeatureStore(repo_path="feast/")
 
-    # Retrieve offline features
-    entity_df = pd.DataFrame({"event_id": [], "event_timestamp": pd.to_datetime([])})
+    # Build entity_df from the staged offline Parquet (all event_id + event_timestamp pairs)
+    from src.core.duckdb_client import get_duckdb_connection
+    _conn = get_duckdb_connection()
+    try:
+        entity_df = _conn.execute(
+            "SELECT event_id, event_timestamp "
+            "FROM read_parquet('s3://offline-store/parquet/raw_events/staged.parquet')"
+        ).df()
+    finally:
+        _conn.close()
+
+    if entity_df.empty:
+        raise ValueError("No entities found in offline store — run materialization first.")
+
     feature_df = store.get_historical_features(
         entity_df=entity_df,
         features=[f"{feature_view}:feature_1", f"{feature_view}:feature_2"],
     ).to_df()
 
     if feature_df.empty:
-        raise ValueError("No training data found in offline store.")
+        raise ValueError("No training data returned from Feast offline store.")
 
     X = feature_df.drop(columns=["event_id", "event_timestamp", "label"], errors="ignore")
     y = feature_df.get("label", pd.Series([0] * len(feature_df)))

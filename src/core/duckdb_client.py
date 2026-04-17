@@ -10,9 +10,18 @@ Usage:
     conn.execute("SELECT * FROM read_parquet('s3://offline-store/parquet/raw_events/**/*.parquet')")
 """
 
+import re
+
 import duckdb
 
 from src.core.config import settings
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def _validate_identifier(name: str) -> None:
+    if not _IDENT_RE.match(name):
+        raise ValueError(f"Unsafe SQL identifier: {name!r}")
 
 
 def get_duckdb_connection() -> duckdb.DuckDBPyConnection:
@@ -79,6 +88,7 @@ def register_delta_as_table(
     """
     from deltalake import DeltaTable
 
+    _validate_identifier(table_name)
     dt = DeltaTable(delta_path, storage_options=storage_options)
     arrow_table = dt.to_pyarrow()
     conn.register(table_name, arrow_table)
