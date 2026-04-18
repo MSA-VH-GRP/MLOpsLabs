@@ -16,37 +16,39 @@ Data lineage:
 from datetime import timedelta
 
 from feast import Entity, FeatureView, Field, FileSource
-from feast.types import Float32, Int64, String
+from feast.types import Int64
 
 # ── Entity ──────────────────────────────────────────────────────────────────
-event_entity = Entity(
-    name="event_id",
-    description="Unique identifier for each ingested event",
+user_entity = Entity(
+    name="user_id",
+    description="Unique identifier for each user",
 )
 
 # ── Offline source ───────────────────────────────────────────────────────────
 # Points to the Parquet file written by DuckDB's stage_to_parquet().
-# The DuckDB offline store reads this file via its httpfs S3 extension.
+# Source: delta/train → materialization.py STAGING_SQL → this Parquet.
 # S3 credentials are injected via AWS_* environment variables at runtime
 # (set in materialization.py → _set_aws_env()).
 raw_event_source = FileSource(
-    path="s3://offline-store/parquet/raw_events/staged.parquet",
+    path="s3://offline-store/parquet/users/staged.parquet",
     timestamp_field="event_timestamp",
     s3_endpoint_override="http://minio:9000",
 )
 
 # ── Feature View ─────────────────────────────────────────────────────────────
-# Schema matches the columns produced by STAGING_SQL in materialization.py.
+# Schema matches the flat columns produced by STAGING_SQL in materialization.py.
+# item_seq / genre_seq / time_seq stay in Delta only — consumed by trainer.py.
 raw_event_feature_view = FeatureView(
     name="raw_event_features",
-    entities=[event_entity],
+    entities=[user_entity],
     ttl=timedelta(days=7),
     schema=[
-        Field(name="feature_1", dtype=Float32),
-        Field(name="feature_2", dtype=Float32),
-        Field(name="category",  dtype=String),
-        Field(name="count",     dtype=Int64),
+        Field(name="gender_idx",  dtype=Int64),
+        Field(name="age_idx",     dtype=Int64),
+        Field(name="occupation",  dtype=Int64),
+        Field(name="target",      dtype=Int64),
+        Field(name="target_time", dtype=Int64),
     ],
     source=raw_event_source,
-    description="Features extracted from raw events — staged via DuckDB from Delta Lake",
+    description="Flat user features from MovieLens — staged via DuckDB from delta/train",
 )
