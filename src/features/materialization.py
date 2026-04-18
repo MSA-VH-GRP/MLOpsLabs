@@ -4,9 +4,9 @@ Materialization job: Delta Lake → DuckDB staging → Parquet → Feast → Red
 Revised data flow
 -----------------
                                ┌─────────────────────────────────┐
-  Kafka consumer               │         MinIO (S3)               │
+  preprocess.py                │         MinIO (S3)               │
   writes Delta ──────────────► │  s3://offline-store/delta/       │
-                               │  raw_events/                     │
+                               │  train/                          │
                                └────────────┬────────────────────┘
                                             │ deltalake → PyArrow
                                             ▼
@@ -21,7 +21,7 @@ Revised data flow
                                ┌─────────────────────────────────┐
                                │         MinIO (S3)               │
                                │  s3://offline-store/parquet/     │
-                               │  raw_events/staged.parquet       │
+                               │  users/staged.parquet            │
                                └────────────┬────────────────────┘
                                             │ Feast DuckDB offline store
                                             ▼

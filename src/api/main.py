@@ -9,6 +9,13 @@ from src.api.metrics import setup_metrics
 from src.api.routers import health, ingest, predict, train
 from src.core.config import settings
 
+import logging
+from contextlib import asynccontextmanager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

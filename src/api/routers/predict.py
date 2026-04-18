@@ -1,22 +1,20 @@
-"""POST /predict — fetch features from Redis, run inference, cache result."""
+"""POST /predict — validates request, delegates to models.predict, returns response."""
 
+import asyncio
 import logging
 import re
 import time
 
-import mlflow
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException
 from feast import FeatureStore
 
 from src.api.dependencies import get_feature_store
 from src.api.schemas.predict import PredictRequest, PredictResponse
-from src.core.config import settings
+from src.models.predict import run_predict
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Allowlist pattern: alphanumeric, hyphens, underscores, dots only.
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
 
 
@@ -36,22 +34,14 @@ async def predict(
     t0 = time.perf_counter()
 
     try:
-        entity_rows = [{"event_id": eid} for eid in request.entity_ids]
-        feature_vector = store.get_online_features(
-            features=store.get_feature_service(request.feature_service),
-            entity_rows=entity_rows,
-        ).to_dict()
-
-        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-        model_uri = f"models:/{request.model_name}@{request.model_alias}"
-        model = mlflow.pyfunc.load_model(model_uri)
-
-        df = pd.DataFrame(feature_vector)
-        raw_preds = model.predict(df)
-        predictions = [
-            {"entity_id": eid, "prediction": pred}
-            for eid, pred in zip(request.entity_ids, raw_preds)
-        ]
+        predictions = await asyncio.to_thread(
+            run_predict,
+            store,
+            request.entity_ids,
+            request.feature_service,
+            request.model_name,
+            request.model_alias,
+        )
     except HTTPException:
         raise
     except Exception as exc:

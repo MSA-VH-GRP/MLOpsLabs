@@ -32,7 +32,7 @@ user_entity = Entity(
 raw_event_source = FileSource(
     path="s3://offline-store/parquet/users/staged.parquet",
     timestamp_field="event_timestamp",
-    s3_endpoint_override="http://minio:9000",
+    s3_endpoint_override="http://localhost:9000",  # host-accessible MinIO; Docker uses httpfs via DuckDB
 )
 
 # ── Feature View ─────────────────────────────────────────────────────────────
