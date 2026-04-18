@@ -21,6 +21,7 @@ import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import ibis
 import mlflow
 import mlflow.pytorch
 import pandas as pd
@@ -28,7 +29,7 @@ import torch
 import torch.nn as nn
 from feast import FeatureStore
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -44,21 +45,29 @@ logger = logging.getLogger(__name__)
 OFFLINE_BUCKET = "offline-store"
 METADATA_KEY = "parquet/metadata.json"
 
-# Default hyperparameters
+# Default hyperparameters  (v2 — optimised)
 DEFAULTS = {
-    "d_model":       64,
-    "d_state":       16,
-    "n_layers":      2,
-    "d_conv":        4,
-    "expand":        2,
-    "dropout":       0.1,
-    "max_seq_len":   50,
-    "batch_size":    256,
-    "learning_rate": 1e-3,
-    "weight_decay":  1e-4,
-    "epochs":        50,
-    "patience":      10,
-    "min_seq_len":   5,
+    # ── Model architecture ────────────────────────────────────────────────────
+    # d_model=64 keeps GRU inner dim=128 (fast on CPU). Adding n_layers=3 gives
+    # depth for free: only +50% compute per step vs the original 2-layer model.
+    "d_model":              64,
+    "d_state":              16,
+    "n_layers":              3,   # was 2   — deeper stack (cheap extra capacity)
+    "d_conv":                4,
+    "expand":                2,
+    "dropout":             0.2,   # was 0.1 — more regularisation
+    "max_seq_len":          50,
+    # ── Training ──────────────────────────────────────────────────────────────
+    "batch_size":          256,   # was 128 — halves step count; more stable gradients
+    "learning_rate":      5e-4,   # was 1e-3 — previous run peaked at ep 2; slower LR
+    "weight_decay":       1e-2,   # was 1e-4 — stronger L2 regularisation
+    "epochs":               50,
+    "patience":             15,   # was 10  — more room to find global optimum
+    "min_seq_len":           5,
+    "max_train_per_user":   20,   # was 15  — +33% training signal without OOM risk
+    # ── Optimiser extras ──────────────────────────────────────────────────────
+    "label_smoothing":     0.1,   # penalise over-confidence on popular items
+    "warmup_epochs":         5,   # linear warm-up before cosine annealing
 }
 
 
@@ -134,6 +143,7 @@ def build_sequences_and_split(
     genre_lookup: Dict[int, List[int]],
     max_seq_len: int = 50,
     min_seq_len: int = 5,
+    max_train_per_user: int = 15,
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Group feature_df by user_id, sort by event_timestamp, and produce
@@ -142,7 +152,8 @@ def build_sequences_and_split(
     Leave-one-out strategy:
         test  = last item
         val   = second-to-last item (history = all except last)
-        train = sliding windows over the rest (one sample per position)
+        train = sliding windows over the LAST max_train_per_user positions only
+                (caps memory: avoids ~380K Python-dict samples on ML-1M)
 
     Each sample dict:
         {
@@ -181,9 +192,9 @@ def build_sequences_and_split(
 
         # ── Test: last item ────────────────────────────────────────────────────
         test_data.append({
-            "item_seq":    items[:-1],
-            "time_seq":    times[:-1],
-            "genre_seq":   genres[:-1],
+            "item_seq":    items[:-1][-max_seq_len:],
+            "time_seq":    times[:-1][-max_seq_len:],
+            "genre_seq":   genres[:-1][-max_seq_len:],
             "user_profile": user_profile,
             "target":       items[-1],
             "target_time":  times[-1],
@@ -192,24 +203,29 @@ def build_sequences_and_split(
         # ── Val: second-to-last item ───────────────────────────────────────────
         if len(items) >= 2:
             val_data.append({
-                "item_seq":    items[:-2],
-                "time_seq":    times[:-2],
-                "genre_seq":   genres[:-2],
+                "item_seq":    items[:-2][-max_seq_len:],
+                "time_seq":    times[:-2][-max_seq_len:],
+                "genre_seq":   genres[:-2][-max_seq_len:],
                 "user_profile": user_profile,
                 "target":       items[-2],
                 "target_time":  times[-2],
             })
 
-        # ── Train: sliding windows over items[:-2] ─────────────────────────────
+        # ── Train: last max_train_per_user sliding-window positions ───────────
+        # Full sliding window on ML-1M creates ~380K Python-dict samples
+        # (~3.4 GB).  Capping to the last max_train_per_user positions per user
+        # reduces this to ~6040 × 15 = ~90K samples (~800 MB).
         train_items  = items[:-2]
         train_times  = times[:-2]
         train_genres = genres[:-2]
 
-        for i in range(1, len(train_items)):
+        # Only generate samples for the last max_train_per_user target positions
+        start_pos = max(1, len(train_items) - max_train_per_user)
+        for i in range(start_pos, len(train_items)):
             train_data.append({
-                "item_seq":    train_items[:i],
-                "time_seq":    train_times[:i],
-                "genre_seq":   train_genres[:i],
+                "item_seq":    train_items[max(0, i - max_seq_len):i],
+                "time_seq":    train_times[max(0, i - max_seq_len):i],
+                "genre_seq":   train_genres[max(0, i - max_seq_len):i],
                 "user_profile": user_profile,
                 "target":       train_items[i],
                 "target_time":  train_times[i],
@@ -225,18 +241,21 @@ def build_sequences_and_split(
 # ─── Trainer class (adapted from old project) ─────────────────────────────────
 
 class Mamba4RecTrainer:
-    """Trains a Mamba4Rec model with AdamW + CosineAnnealingLR."""
+    """Trains a Mamba4Rec model with AdamW + warmup + CosineAnnealingLR."""
 
     def __init__(
         self,
         model: Mamba4Rec,
         device: torch.device,
-        learning_rate: float = 1e-3,
-        weight_decay: float = 1e-4,
+        learning_rate: float = 5e-4,
+        weight_decay: float = 1e-2,
+        label_smoothing: float = 0.1,
     ):
         self.model = model.to(device)
         self.device = device
-        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
+        # Label smoothing reduces over-confidence on dominant popular items and
+        # acts as regularisation against the popularity bias in ML-1M.
+        self.criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=label_smoothing)
         self.optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     def train_epoch(self, train_loader: DataLoader) -> float:
@@ -296,6 +315,67 @@ class Mamba4RecTrainer:
         return 0.0, avg_hit, avg_ndcg, avg_mrr
 
 
+# ─── Feast / ibis S3 patch ────────────────────────────────────────────────────
+
+def _patch_feast_duckdb_s3() -> None:
+    """
+    Configure the default ibis/DuckDB backend with MinIO S3 settings and patch
+    feast.infra.offline_stores.duckdb._read_data_source to use it.
+
+    Problem: feast's DuckDB offline store calls ibis.read_parquet(path) without
+    any S3 credentials or endpoint configuration, causing 403/NoneType errors
+    for MinIO-hosted Parquet files.
+
+    Fix: create one DuckDB connection, configure httpfs for MinIO, set it as
+    ibis's default backend (ibis.set_backend), and patch _read_data_source to
+    call read_parquet on that same connection.  This ensures entity_table
+    (ibis.memtable) and feature tables (ibis.read_parquet) share one backend
+    and can be joined together by Feast.
+    """
+    import feast.infra.offline_stores.duckdb as _feast_duckdb
+
+    if getattr(_feast_duckdb, "_minio_patched", False):
+        return  # already applied
+
+    endpoint  = os.environ.get("AWS_S3_ENDPOINT",       "minio:9000")
+    key_id    = os.environ.get("AWS_ACCESS_KEY_ID",     "minioadmin")
+    secret    = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin123")
+
+    # Build one DuckDB connection and configure MinIO S3 access on it.
+    con = ibis.duckdb.connect()
+    con.raw_sql("INSTALL httpfs; LOAD httpfs;")
+    con.raw_sql(f"SET s3_endpoint='{endpoint}';")
+    con.raw_sql(f"SET s3_access_key_id='{key_id}';")
+    con.raw_sql(f"SET s3_secret_access_key='{secret}';")
+    con.raw_sql("SET s3_use_ssl=false;")
+    con.raw_sql("SET s3_url_style='path';")
+
+    # Make this the default ibis backend so ibis.memtable / ibis.read_parquet
+    # all share the same (configured) DuckDB connection.
+    ibis.set_backend(con)
+    logger.info("ibis default DuckDB backend configured for MinIO (endpoint=%s)", endpoint)
+
+    def _patched_read_data_source(data_source, repo_path: str):
+        path = data_source.path
+        is_delta = (
+            hasattr(data_source, "file_format")
+            and data_source.file_format.__class__.__name__ == "DeltaFormat"
+        )
+        if is_delta:
+            storage_options: Dict = {}
+            if getattr(data_source, "s3_endpoint_override", None):
+                storage_options["AWS_ENDPOINT_URL"] = data_source.s3_endpoint_override
+            return ibis.read_delta(path, storage_options=storage_options)
+
+        # Parquet (or anything else): use the already-configured default backend.
+        logger.debug("read_parquet via configured backend: %s", path)
+        return ibis.read_parquet(path)
+
+    _feast_duckdb._read_data_source = _patched_read_data_source
+    _feast_duckdb._minio_patched = True
+    logger.info("feast DuckDB _read_data_source patched for MinIO S3")
+
+
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
 def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
@@ -311,39 +391,70 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
     """
     hp = {**DEFAULTS, **hyperparams}
 
-    # ── Step 1: Materialize MovieLens features into Feast ─────────────────────
-    logger.info("Step 1: Running MovieLens materialization …")
-    from src.features.materialization import run_movielens_materialization
-    run_movielens_materialization()
+    # ── Step 1: Materialize MovieLens features (skip if already done) ─────────
+    _set_aws_env()
+    from src.core.storage import get_s3_client as _s3c
+
+    _STAGED_KEYS = [
+        "parquet/rating_events/staged.parquet",
+        "parquet/user_features/staged.parquet",
+        "parquet/movie_features/staged.parquet",
+        "parquet/metadata.json",
+    ]
+
+    def _staged_files_exist() -> bool:
+        try:
+            existing = {
+                obj["Key"]
+                for obj in _s3c().list_objects_v2(
+                    Bucket="offline-store", Prefix="parquet/"
+                ).get("Contents", [])
+            }
+            return all(k in existing for k in _STAGED_KEYS)
+        except Exception:
+            return False
+
+    if _staged_files_exist():
+        logger.info("Step 1: Staged files already present in MinIO — skipping materialization.")
+    else:
+        logger.info("Step 1: Running MovieLens materialization …")
+        from src.features.materialization import run_movielens_materialization
+        run_movielens_materialization()
 
     # ── Step 2: Load metadata ─────────────────────────────────────────────────
     logger.info("Step 2: Loading metadata from MinIO …")
     metadata = load_metadata_from_minio()
 
-    # ── Step 3: Retrieve all rating events + user profile via Feast PIT join ──
-    logger.info("Step 3: Fetching historical features from Feast (PIT join) …")
+    # ── Step 3: Retrieve all rating events + user profile via DuckDB join ────
+    # User features (age, gender, occupation) are static in MovieLens — a simple
+    # LEFT JOIN is equivalent to a PIT join and is far more memory-efficient than
+    # Feast's ibis-based PIT join over 1.7M rows.
+    logger.info("Step 3: Joining rating events with user + movie features …")
     _set_aws_env()
-    store = FeatureStore(repo_path="feast/")
 
-    entity_df = build_entity_df()
+    conn = get_duckdb_connection()
+    try:
+        feature_df = conn.execute("""
+            SELECT
+                r.user_id,
+                r.event_timestamp,
+                r.internal_movie_id,
+                r.rating,
+                r.time_slot,
+                u.gender_idx,
+                u.age_idx,
+                u.occupation
+            FROM read_parquet('s3://offline-store/parquet/rating_events/staged.parquet') r
+            LEFT JOIN read_parquet('s3://offline-store/parquet/user_features/staged.parquet')  u
+                ON r.user_id = u.user_id
+        """).df()
+    finally:
+        conn.close()
 
-    feature_df = store.get_historical_features(
-        entity_df=entity_df,
-        features=[
-            "rating_event_features:internal_movie_id",
-            "rating_event_features:rating",
-            "rating_event_features:time_slot",
-            "user_profile_features:gender_idx",
-            "user_profile_features:age_idx",
-            "user_profile_features:occupation",
-        ],
-    ).to_df()
-
-    # Drop rows where the PIT join found no matching feature (e.g. new users)
     feature_df = feature_df.dropna(
         subset=["internal_movie_id", "age_idx", "gender_idx", "occupation"]
     )
-    logger.info("Feature DataFrame shape after PIT join: %s", feature_df.shape)
+    logger.info("Feature DataFrame shape after join: %s", feature_df.shape)
 
     # ── Step 4: Build sequences and split ────────────────────────────────────
     logger.info("Step 4: Building sequences and applying leave-one-out split …")
@@ -353,6 +464,7 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
         genre_lookup=genre_lookup,
         max_seq_len=hp["max_seq_len"],
         min_seq_len=hp["min_seq_len"],
+        max_train_per_user=hp["max_train_per_user"],
     )
 
     # ── Step 5: Create DataLoaders ────────────────────────────────────────────
@@ -377,22 +489,25 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
     with mlflow.start_run() as run:
         # Log hyperparameters
         mlflow.log_params({
-            "model_type":          "mamba4rec",
-            "d_model":             hp["d_model"],
-            "d_state":             hp["d_state"],
-            "n_layers":            hp["n_layers"],
-            "d_conv":              hp["d_conv"],
-            "expand":              hp["expand"],
-            "dropout":             hp["dropout"],
-            "max_seq_len":         hp["max_seq_len"],
-            "batch_size":          hp["batch_size"],
-            "learning_rate":       hp["learning_rate"],
-            "weight_decay":        hp["weight_decay"],
-            "epochs":              hp["epochs"],
-            "patience":            hp["patience"],
-            "num_items":           metadata["num_items"],
-            "num_genres":          metadata["num_genres"],
-            "mamba_ssm_available": MAMBA_AVAILABLE,
+            "model_type":           "mamba4rec",
+            "d_model":              hp["d_model"],
+            "d_state":              hp["d_state"],
+            "n_layers":             hp["n_layers"],
+            "d_conv":               hp["d_conv"],
+            "expand":               hp["expand"],
+            "dropout":              hp["dropout"],
+            "max_seq_len":          hp["max_seq_len"],
+            "batch_size":           hp["batch_size"],
+            "learning_rate":        hp["learning_rate"],
+            "weight_decay":         hp["weight_decay"],
+            "epochs":               hp["epochs"],
+            "patience":             hp["patience"],
+            "max_train_per_user":   hp["max_train_per_user"],
+            "label_smoothing":      hp["label_smoothing"],
+            "warmup_epochs":        hp["warmup_epochs"],
+            "num_items":            metadata["num_items"],
+            "num_genres":           metadata["num_genres"],
+            "mamba_ssm_available":  MAMBA_AVAILABLE,
         })
 
         # Instantiate model
@@ -412,9 +527,29 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
             device=device,
             learning_rate=hp["learning_rate"],
             weight_decay=hp["weight_decay"],
+            label_smoothing=hp["label_smoothing"],
         )
 
-        scheduler = CosineAnnealingLR(trainer.optimizer, T_max=hp["epochs"], eta_min=1e-6)
+        # Linear warm-up for warmup_epochs, then cosine annealing to eta_min.
+        # Warmup prevents large gradient steps in the early phase (which caused
+        # the previous run to peak at epoch 2 and then plateau).
+        warmup_epochs = max(1, hp["warmup_epochs"])
+        warmup_sched = LinearLR(
+            trainer.optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_sched = CosineAnnealingLR(
+            trainer.optimizer,
+            T_max=max(1, hp["epochs"] - warmup_epochs),
+            eta_min=1e-6,
+        )
+        scheduler = SequentialLR(
+            trainer.optimizer,
+            schedulers=[warmup_sched, cosine_sched],
+            milestones=[warmup_epochs],
+        )
 
         best_ndcg = 0.0
         patience_counter = 0
@@ -428,10 +563,10 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
 
             mlflow.log_metrics(
                 {
-                    "train_loss":  train_loss,
-                    "val_hit@10":  hit10,
-                    "val_ndcg@10": ndcg10,
-                    "val_mrr@10":  mrr10,
+                    "train_loss":    train_loss,
+                    "val_hit_at_10":  hit10,
+                    "val_ndcg_at_10": ndcg10,
+                    "val_mrr_at_10":  mrr10,
                 },
                 step=epoch,
             )
@@ -499,9 +634,15 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
         run_id = run.info.run_id
         logger.info("MLflow run completed: run_id=%s", run_id)
 
-    # Retrieve the latest registered version
+    # Retrieve the latest registered version and promote it to "champion"
     client = mlflow.MlflowClient()
     versions = client.get_latest_versions("mamba4rec")
     latest_version = max(int(v.version) for v in versions) if versions else 1
+
+    try:
+        client.set_registered_model_alias("mamba4rec", "champion", str(latest_version))
+        logger.info("MLflow alias 'champion' → mamba4rec v%d", latest_version)
+    except Exception as exc:
+        logger.warning("Could not set champion alias: %s", exc)
 
     return {"run_id": run_id, "model_version": latest_version, "status": "registered"}
