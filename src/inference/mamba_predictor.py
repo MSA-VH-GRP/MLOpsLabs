@@ -175,35 +175,62 @@ class MambaPredictor:
             List of recommendation dicts: rank, movie_id, title, genres, score, time_slot
         """
         max_seq_len = self.metadata.get("max_seq_len", 50)
+        num_items   = self.metadata["num_items"]
+
         inputs = self._prepare_input(item_history, time_history, max_seq_len=max_seq_len)
 
         age_t    = torch.LongTensor([[age_idx]]).to(self.device)
         gender_t = torch.LongTensor([[gender_idx]]).to(self.device)
         occ_t    = torch.LongTensor([[occupation]]).to(self.device)
 
-        scores = self.model.predict_scores(
-            inputs["item_seq"],
-            inputs["genre_seq"],
-            inputs["time_seq"],
-            age_t, gender_t, occ_t,
-        ).squeeze(0).cpu().numpy()
+        # ── Extract last hidden state and score all items via dot product ───
+        #
+        # Root-cause: sequences are LEFT-padded: [0,…,0,item1,…,itemN].
+        # The model's seq_lengths = (item_seq!=0).sum()-1 = N-1 points to the
+        # (N-1)-th position from the START, which is still in the padding region
+        # for short histories (N << max_seq_len=50).  Hidden states at padding
+        # positions are near-identical regardless of item content → same ranking
+        # for every user.
+        #
+        # Fix: extract hidden[:, -1, :] — the LAST position in the sequence.
+        # For left-padded input the GRU has seen all real items by position L-1,
+        # so the last hidden state encodes the full sequence context.
+        # Cosine similarity test: position N-1 ≈ 1.000 (constant), position -1
+        # ≈ 0.34 (genuinely different) — confirmed empirically.
+        #
+        # Score all real items via dot product with item embeddings (same path
+        # used by EvalDataset during training validation).
+        max_item_idx = self.model.item_embedding.num_embeddings  # e.g. 3639
+        with torch.no_grad():
+            hidden = self.model.forward(
+                inputs["item_seq"],
+                inputs["genre_seq"],
+                inputs["time_seq"],
+                age_t, gender_t, occ_t,
+                return_hidden=True,
+            )  # (1, seq_len, d_model)
+            last_hidden = hidden[0, -1]        # (d_model,)  — last position
 
-        # Exclude padding
-        scores[0] = -np.inf
+            all_ids  = torch.arange(1, max_item_idx, device=self.device)   # (N-1,)
+            item_emb = self.model.item_embedding(all_ids)                   # (N-1, d_model)
+            raw_scores = (item_emb @ last_hidden).cpu().numpy()             # (N-1,)
+
+        # scores[internal_id] = score; index 0 (padding) and max_item_idx stay -inf
+        scores = np.full(max_item_idx, -np.inf, dtype=np.float32)
+        scores[1:] = raw_scores
 
         # Exclude already watched items
         for idx in item_history:
-            if 0 <= idx < len(scores):
+            if 0 < idx < max_item_idx:
                 scores[idx] = -np.inf
 
         if now_showing_only:
-            all_ids = list(range(1, self.metadata["num_items"]))
+            all_ids = list(range(1, max_item_idx))
             np.random.seed(42)
             now_showing = set(np.random.choice(all_ids, size=min(200, len(all_ids)), replace=False))
             mask = np.full_like(scores, -np.inf)
             for idx in now_showing:
-                if idx < len(mask):
-                    mask[idx] = 0
+                mask[idx] = 0
             scores = np.where(mask == 0, scores, -np.inf)
 
         top_indices = np.argsort(scores)[::-1][:top_k]
