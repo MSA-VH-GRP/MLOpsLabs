@@ -32,3 +32,38 @@ HEALTH_STATUS = Gauge(
     ["service"],
     registry=REGISTRY,
 )
+
+# ---- ML metrics for dashboard ----
+
+PREDICTION_RATING_TOTAL = Counter(
+    "prediction_rating_total",
+    "Count of predicted rating values",
+    ["rating"],
+    registry=REGISTRY,
+)
+
+MODEL_INFO = Gauge(
+    "model_info",
+    "Current model info",
+    ["model_name", "model_alias"],
+    registry=REGISTRY,
+)
+
+FEATURE_MISSING_RATE = Gauge(
+    "feature_missing_rate",
+    "Missing rate for feature inputs",
+    ["feature"],
+    registry=REGISTRY,
+)
+
+PREDICTION_DRIFT_SCORE = Gauge(
+    "prediction_drift_score",
+    "Synthetic prediction drift score",
+    registry=REGISTRY,
+)
+
+MOCK_PREDICTIONS_TOTAL = Counter(
+    "mock_predictions_total",
+    "Total mock predictions generated",
+    registry=REGISTRY,
+)
