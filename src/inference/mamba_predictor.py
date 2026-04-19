@@ -10,11 +10,12 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import mlflow
 import mlflow.pytorch
 import numpy as np
+import redis
 import torch
 
 from src.core.config import settings
@@ -26,6 +27,45 @@ TIME_SLOTS = {
     1: "Prime Time (18:00-21:59)",
     2: "Late Night (22:00-5:59)",
 }
+
+# Redis key for the currently-showing movie SET (maintained by ShowingPipeline)
+REDIS_SHOWING_ACTIVE = "showing:active"
+
+# Module-level Redis client — shared across all predictor calls
+_redis_client: Optional[redis.Redis] = None
+
+
+def _get_redis() -> redis.Redis:
+    """Return (and lazily create) the module-level Redis client."""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+    return _redis_client
+
+
+def _fetch_showing_ids() -> Optional[Set[int]]:
+    """
+    Fetch the set of currently-showing internal_movie_ids from Redis.
+
+    Returns:
+        A set of integer internal_movie_ids, or None if the key does not exist
+        (i.e. no showing schedule has been ingested yet).
+    """
+    try:
+        raw = _get_redis().smembers(REDIS_SHOWING_ACTIVE)
+        if not raw:
+            logger.warning(
+                "Redis key '%s' is empty or missing — "
+                "no showing schedule ingested yet. Falling back to full catalog.",
+                REDIS_SHOWING_ACTIVE,
+            )
+            return None
+        return {int(v) for v in raw}
+    except redis.RedisError as exc:
+        logger.error(
+            "Redis error while fetching showing:active — falling back to full catalog: %s", exc
+        )
+        return None
 
 
 class MambaPredictor:
@@ -161,21 +201,28 @@ class MambaPredictor:
         """
         Return top-K movie recommendations.
 
+        When now_showing_only=True, candidate items are pre-filtered to those
+        present in the Redis SET "showing:active" (maintained by ShowingPipeline).
+        The model only computes dot-product scores for that candidate subset —
+        not the entire catalog — making inference proportionally faster.
+
         Args:
-            item_history:    Ordered list of watched internal movie IDs
-            time_history:    Time slot for each watched movie
-            age_idx:         0–6 (ML-1M age groups)
-            gender_idx:      0=F, 1=M
-            occupation:      0–20
-            top_k:           Number of recommendations
-            target_time:     Time slot for this session
-            now_showing_only: If True, restrict to a random subset (demo)
+            item_history:     Ordered list of watched internal movie IDs
+            time_history:     Time slot for each watched movie
+            age_idx:          0–6 (ML-1M age groups)
+            gender_idx:       0=F, 1=M
+            occupation:       0–20
+            top_k:            Number of recommendations to return
+            target_time:      Time slot for this session (used in response label)
+            now_showing_only: If True, restrict candidates to currently showing
+                              movies fetched from Redis. Falls back to full catalog
+                              if Redis is unavailable or the key is empty.
 
         Returns:
             List of recommendation dicts: rank, movie_id, title, genres, score, time_slot
         """
-        max_seq_len = self.metadata.get("max_seq_len", 50)
-        num_items   = self.metadata["num_items"]
+        max_seq_len  = self.metadata.get("max_seq_len", 50)
+        max_item_idx = self.model.item_embedding.num_embeddings  # vocab size incl. padding
 
         inputs = self._prepare_input(item_history, time_history, max_seq_len=max_seq_len)
 
@@ -183,61 +230,75 @@ class MambaPredictor:
         gender_t = torch.LongTensor([[gender_idx]]).to(self.device)
         occ_t    = torch.LongTensor([[occupation]]).to(self.device)
 
-        # ── Extract last hidden state and score all items via dot product ───
+        # ── Step 1: Extract user representation (last hidden state) ───────────
         #
-        # Root-cause: sequences are LEFT-padded: [0,…,0,item1,…,itemN].
-        # The model's seq_lengths = (item_seq!=0).sum()-1 = N-1 points to the
-        # (N-1)-th position from the START, which is still in the padding region
-        # for short histories (N << max_seq_len=50).  Hidden states at padding
-        # positions are near-identical regardless of item content → same ranking
-        # for every user.
+        # Sequences are LEFT-padded: [0,…,0, item1,…, itemN].
+        # hidden[:, -1, :] — the final position — encodes the full sequence
+        # context regardless of history length, producing genuinely personalised
+        # scores (cosine similarity to padding positions ≈ 1.0 → constant ranking).
+        hidden = self.model.forward(
+            inputs["item_seq"],
+            inputs["genre_seq"],
+            inputs["time_seq"],
+            age_t, gender_t, occ_t,
+            return_hidden=True,
+        )  # (1, seq_len, d_model)
+        last_hidden = hidden[0, -1]   # (d_model,)
+
+        # ── Step 2: Resolve candidate item IDs (pre-filtering) ────────────────
         #
-        # Fix: extract hidden[:, -1, :] — the LAST position in the sequence.
-        # For left-padded input the GRU has seen all real items by position L-1,
-        # so the last hidden state encodes the full sequence context.
-        # Cosine similarity test: position N-1 ≈ 1.000 (constant), position -1
-        # ≈ 0.34 (genuinely different) — confirmed empirically.
-        #
-        # Score all real items via dot product with item embeddings (same path
-        # used by EvalDataset during training validation).
-        max_item_idx = self.model.item_embedding.num_embeddings  # e.g. 3639
-        with torch.no_grad():
-            hidden = self.model.forward(
-                inputs["item_seq"],
-                inputs["genre_seq"],
-                inputs["time_seq"],
-                age_t, gender_t, occ_t,
-                return_hidden=True,
-            )  # (1, seq_len, d_model)
-            last_hidden = hidden[0, -1]        # (d_model,)  — last position
-
-            all_ids  = torch.arange(1, max_item_idx, device=self.device)   # (N-1,)
-            item_emb = self.model.item_embedding(all_ids)                   # (N-1, d_model)
-            raw_scores = (item_emb @ last_hidden).cpu().numpy()             # (N-1,)
-
-        # scores[internal_id] = score; index 0 (padding) and max_item_idx stay -inf
-        scores = np.full(max_item_idx, -np.inf, dtype=np.float32)
-        scores[1:] = raw_scores
-
-        # Exclude already watched items
-        for idx in item_history:
-            if 0 < idx < max_item_idx:
-                scores[idx] = -np.inf
+        # Hướng C — Candidate Pre-filtering:
+        #   • Fetch currently-showing IDs from Redis SET "showing:active".
+        #   • Pass only those IDs to the dot-product step so the model scores
+        #     ~200 candidates instead of the full catalog (~3 600+ items).
+        #   • Falls back to the full catalog when Redis is unavailable or the
+        #     showing set is empty (safe degradation, same behaviour as before).
+        watched_set = set(item_history)
 
         if now_showing_only:
-            all_ids = list(range(1, max_item_idx))
-            np.random.seed(42)
-            now_showing = set(np.random.choice(all_ids, size=min(200, len(all_ids)), replace=False))
-            mask = np.full_like(scores, -np.inf)
-            for idx in now_showing:
-                mask[idx] = 0
-            scores = np.where(mask == 0, scores, -np.inf)
+            showing_ids = _fetch_showing_ids()   # Set[int] | None
+            if showing_ids:
+                # Keep only valid internal IDs within the embedding vocab range,
+                # excluding the padding index (0) and already-watched items.
+                candidate_ids = sorted(
+                    idx for idx in showing_ids
+                    if 0 < idx < max_item_idx and idx not in watched_set
+                )
+                logger.info(
+                    "now_showing_only=True: scoring %d/%d showing candidates "
+                    "(watched=%d excluded)",
+                    len(candidate_ids), len(showing_ids), len(watched_set),
+                )
+            else:
+                # Graceful fallback: score full catalog
+                logger.warning(
+                    "now_showing_only=True but showing:active is empty/unreachable — "
+                    "falling back to full catalog scoring."
+                )
+                candidate_ids = [
+                    idx for idx in range(1, max_item_idx) if idx not in watched_set
+                ]
+        else:
+            candidate_ids = [
+                idx for idx in range(1, max_item_idx) if idx not in watched_set
+            ]
 
-        top_indices = np.argsort(scores)[::-1][:top_k]
+        if not candidate_ids:
+            logger.warning("No candidate items after filtering — returning empty recommendations.")
+            return []
+
+        # ── Step 3: Dot-product scoring over candidates only ──────────────────
+        candidate_tensor = torch.LongTensor(candidate_ids).to(self.device)  # (C,)
+        item_emb         = self.model.item_embedding(candidate_tensor)       # (C, d_model)
+        candidate_scores = (item_emb @ last_hidden).cpu().numpy()            # (C,)
+
+        # ── Step 4: Rank and translate to original movie IDs ──────────────────
+        top_local_indices = np.argsort(candidate_scores)[::-1][:top_k]
 
         recommendations = []
-        for rank, idx in enumerate(top_indices):
-            original_movie_id = self.reverse_movie_map.get(int(idx))
+        for rank, local_idx in enumerate(top_local_indices):
+            internal_id       = candidate_ids[local_idx]
+            original_movie_id = self.reverse_movie_map.get(internal_id)
             if original_movie_id is None:
                 continue
             recommendations.append({
@@ -245,7 +306,7 @@ class MambaPredictor:
                 "movie_id":  original_movie_id,
                 "title":     self.movie_title.get(original_movie_id, f"Movie {original_movie_id}"),
                 "genres":    self.movie_genres.get(original_movie_id, "Unknown"),
-                "score":     float(scores[idx]),
+                "score":     float(candidate_scores[local_idx]),
                 "time_slot": TIME_SLOTS.get(target_time, "Unknown"),
             })
 

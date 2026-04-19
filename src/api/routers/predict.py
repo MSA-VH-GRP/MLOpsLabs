@@ -95,6 +95,7 @@ async def predict_mamba(request: Mamba4RecPredictRequest):
             occupation=request.occupation,
             top_k=request.top_k,
             target_time=request.target_time,
+            now_showing_only=request.now_showing_only,
         )
     except HTTPException:
         raise

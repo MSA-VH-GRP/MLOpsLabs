@@ -46,6 +46,11 @@ class Mamba4RecPredictRequest(BaseModel):
     top_k:       int = 10
     target_time: int = 1  # time slot for this session
 
+    # Candidate pre-filtering: restrict scoring to currently showing movies
+    # (fetched from Redis SET "showing:active" at serving time).
+    # When False (default), the model scores every item in the catalog.
+    now_showing_only: bool = False
+
 
 class Mamba4RecPredictResponse(BaseModel):
     """Response schema for POST /predict/mamba."""
