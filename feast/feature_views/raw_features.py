@@ -29,10 +29,12 @@ user_entity = Entity(
 # Source: delta/train → materialization.py STAGING_SQL → this Parquet.
 # S3 credentials are injected via AWS_* environment variables at runtime
 # (set in materialization.py → _set_aws_env()).
+import os
+
 raw_event_source = FileSource(
     path="s3://offline-store/parquet/users/staged.parquet",
     timestamp_field="event_timestamp",
-    s3_endpoint_override="http://localhost:9000",  # host-accessible MinIO; Docker uses httpfs via DuckDB
+    s3_endpoint_override=os.environ.get("AWS_ENDPOINT_URL", "http://localhost:9000"),
 )
 
 # ── Feature View ─────────────────────────────────────────────────────────────

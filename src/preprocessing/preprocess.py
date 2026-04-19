@@ -17,6 +17,7 @@ Data lineage:
 import io
 import json
 import logging
+import os
 from typing import Dict, List, Tuple
 
 import boto3
@@ -29,9 +30,9 @@ from deltalake import DeltaTable, write_deltalake
 logger = logging.getLogger(__name__)
 
 # ── MinIO connection settings ─────────────────────────────────────────────────
-MINIO_ENDPOINT   = "http://localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin123"
+MINIO_ENDPOINT   = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:9000")
+MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin123")
 RAW_BUCKET       = "raw-data"
 DELTA_BUCKET     = "offline-store"
 
