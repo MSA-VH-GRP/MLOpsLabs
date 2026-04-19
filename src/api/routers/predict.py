@@ -1,9 +1,12 @@
 """
 POST /predict          — generic sklearn model inference via Feast + MLflow
 POST /predict/mamba    — Mamba4Rec sequential recommendation
+POST /predict/mock     — synthetic predictions for dashboard demo
 """
 
+import asyncio
 import logging
+import random
 import re
 import time
 
@@ -21,9 +24,17 @@ from src.api.schemas.predict import (
 )
 from src.core.config import settings
 from src.core.metrics import (
-    PREDICT_REQUESTS,
+    FEATURE_MISSING_RATE,
+    MODEL_INFO,
+    MOCK_PREDICTIONS_TOTAL,
+    PREDICTION_DRIFT_SCORE,
+    PREDICTION_RATING_TOTAL,
+    PREDICT_BATCH_SIZE,
     PREDICT_ERRORS,
     PREDICT_LATENCY,
+    PREDICT_REQUESTS,
+    SYSTEM_CPU_USAGE,
+    SYSTEM_MEMORY_USAGE,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,8 +66,6 @@ def get_feature_store_with_metrics(request: Request) -> FeatureStore:
         raise
 
 
-# ── Generic sklearn predict ────────────────────────────────────────────────────
-
 @router.post("/predict", response_model=PredictResponse)
 async def predict(
     request: PredictRequest,
@@ -66,6 +75,7 @@ async def predict(
     logger.info(f"Predict request received: {request.entity_ids}")
 
     _validate_model_ref(request.model_name, request.model_alias)
+    PREDICT_BATCH_SIZE.observe(len(request.entity_ids))
 
     t0 = getattr(http_request.state, "predict_start_time", time.perf_counter())
 
@@ -83,10 +93,28 @@ async def predict(
         df = pd.DataFrame(feature_vector)
         raw_preds = model.predict(df)
 
-        predictions = [
-            {"entity_id": eid, "prediction": pred}
-            for eid, pred in zip(request.entity_ids, raw_preds)
-        ]
+        predictions = []
+        for eid, pred in zip(request.entity_ids, raw_preds):
+            predictions.append({"entity_id": eid, "prediction": pred})
+            try:
+                rating = int(round(float(pred)))
+                rating = max(1, min(5, rating))
+                PREDICTION_RATING_TOTAL.labels(rating=str(rating)).inc()
+            except Exception:
+                pass
+
+        MODEL_INFO.labels(
+            model_name=request.model_name,
+            model_alias=request.model_alias,
+        ).set(1)
+
+        # synthetic auxiliary gauges for demo
+        FEATURE_MISSING_RATE.labels(feature="user_age").set(round(random.uniform(0.00, 0.08), 3))
+        FEATURE_MISSING_RATE.labels(feature="movie_genre").set(round(random.uniform(0.00, 0.05), 3))
+        FEATURE_MISSING_RATE.labels(feature="timestamp").set(round(random.uniform(0.00, 0.02), 3))
+        PREDICTION_DRIFT_SCORE.set(round(random.uniform(0.05, 0.35), 3))
+        SYSTEM_CPU_USAGE.set(round(random.uniform(35, 75), 2))
+        SYSTEM_MEMORY_USAGE.set(round(random.uniform(40, 85), 2))
 
         latency = time.perf_counter() - t0
         PREDICT_LATENCY.observe(latency)
@@ -108,13 +136,13 @@ async def predict(
         raise HTTPException(status_code=500, detail="Prediction failed")
 
 
-# ── Mamba4Rec sequential recommendation ───────────────────────────────────────
-
 @router.post("/predict/mamba", response_model=Mamba4RecPredictResponse)
 async def predict_mamba(request: Mamba4RecPredictRequest):
     _validate_model_ref(request.model_name, request.model_alias)
+
     from src.inference.mamba_predictor import get_predictor
 
+    PREDICT_REQUESTS.inc()
     t0 = time.perf_counter()
 
     try:
@@ -128,15 +156,96 @@ async def predict_mamba(request: Mamba4RecPredictRequest):
             top_k=request.top_k,
             target_time=request.target_time,
         )
+
+        MODEL_INFO.labels(
+            model_name=request.model_name,
+            model_alias=request.model_alias,
+        ).set(1)
+        PREDICT_BATCH_SIZE.observe(request.top_k)
+
+        for rec in recommendations:
+            try:
+                score = rec.get("score", 3)
+                rating = int(round(float(score)))
+                rating = max(1, min(5, rating))
+                PREDICTION_RATING_TOTAL.labels(rating=str(rating)).inc()
+            except Exception:
+                pass
+
+        FEATURE_MISSING_RATE.labels(feature="user_age").set(round(random.uniform(0.00, 0.08), 3))
+        FEATURE_MISSING_RATE.labels(feature="item_history").set(round(random.uniform(0.00, 0.03), 3))
+        FEATURE_MISSING_RATE.labels(feature="time_history").set(round(random.uniform(0.00, 0.02), 3))
+        PREDICTION_DRIFT_SCORE.set(round(random.uniform(0.05, 0.35), 3))
+        SYSTEM_CPU_USAGE.set(round(random.uniform(35, 75), 2))
+        SYSTEM_MEMORY_USAGE.set(round(random.uniform(40, 85), 2))
+
+        latency = time.perf_counter() - t0
+        PREDICT_LATENCY.observe(latency)
+
+        return Mamba4RecPredictResponse(
+            recommendations=recommendations,
+            model_version=request.model_alias,
+            latency_ms=round(latency * 1000, 2),
+        )
+
     except HTTPException:
         raise
     except Exception as exc:
+        PREDICT_ERRORS.inc()
+        latency = time.perf_counter() - t0
+        PREDICT_LATENCY.observe(latency)
         logger.exception("Mamba prediction failed")
         raise HTTPException(status_code=500, detail="Prediction failed — check server logs.") from exc
 
-    latency_ms = (time.perf_counter() - t0) * 1000
-    return Mamba4RecPredictResponse(
-        recommendations=recommendations,
-        model_version=request.model_alias,
-        latency_ms=round(latency_ms, 2),
-    )
+
+@router.post("/predict/mock", response_model=PredictResponse)
+async def predict_mock(request: PredictRequest):
+    """
+    Mock prediction endpoint for Grafana / Prometheus demo.
+    Generates fake rating predictions in range 1-5.
+    """
+    PREDICT_REQUESTS.inc()
+    PREDICT_BATCH_SIZE.observe(len(request.entity_ids))
+    MOCK_PREDICTIONS_TOTAL.inc()
+
+    t0 = time.perf_counter()
+
+    try:
+        _validate_model_ref(request.model_name, request.model_alias)
+
+        await asyncio.sleep(random.uniform(0.02, 0.12))
+
+        fake_predictions = []
+        for eid in request.entity_ids:
+            rating = random.randint(1, 5)
+            fake_predictions.append({"entity_id": eid, "prediction": rating})
+            PREDICTION_RATING_TOTAL.labels(rating=str(rating)).inc()
+
+        MODEL_INFO.labels(
+            model_name=request.model_name,
+            model_alias=request.model_alias,
+        ).set(1)
+
+        FEATURE_MISSING_RATE.labels(feature="user_age").set(round(random.uniform(0.00, 0.08), 3))
+        FEATURE_MISSING_RATE.labels(feature="movie_genre").set(round(random.uniform(0.00, 0.05), 3))
+        FEATURE_MISSING_RATE.labels(feature="timestamp").set(round(random.uniform(0.00, 0.02), 3))
+
+        PREDICTION_DRIFT_SCORE.set(round(random.uniform(0.05, 0.35), 3))
+        SYSTEM_CPU_USAGE.set(round(random.uniform(35, 75), 2))
+        SYSTEM_MEMORY_USAGE.set(round(random.uniform(40, 85), 2))
+
+        latency = time.perf_counter() - t0
+        PREDICT_LATENCY.observe(latency)
+
+        return PredictResponse(
+            predictions=fake_predictions,
+            model_version=request.model_alias,
+            latency_ms=round(latency * 1000, 2),
+        )
+
+    except Exception as e:
+        PREDICT_ERRORS.inc()
+        latency = time.perf_counter() - t0
+        PREDICT_LATENCY.observe(latency)
+        logger.exception(f"Mock predict failed latency={latency}: {e}")
+        raise HTTPException(status_code=500, detail="Mock prediction failed")

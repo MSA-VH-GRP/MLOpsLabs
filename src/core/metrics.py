@@ -67,3 +67,15 @@ MOCK_PREDICTIONS_TOTAL = Counter(
     "Total mock predictions generated",
     registry=REGISTRY,
 )
+
+SYSTEM_CPU_USAGE = Gauge(
+    "system_cpu_usage_percent",
+    "Synthetic system CPU usage percent",
+    registry=REGISTRY,
+)
+
+SYSTEM_MEMORY_USAGE = Gauge(
+    "system_memory_usage_percent",
+    "Synthetic system memory usage percent",
+    registry=REGISTRY,
+)
