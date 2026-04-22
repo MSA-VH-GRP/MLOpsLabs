@@ -8,7 +8,7 @@ Defines:
 
 from feast import FeatureService
 
-from feast.feature_views.raw_features import raw_event_feature_view
+from .raw_features import raw_event_feature_view
 
 # ── Feature Service ───────────────────────────────────────────────────────────
 # The /predict endpoint calls store.get_online_features(feature_service=...).

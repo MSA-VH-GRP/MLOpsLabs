@@ -3,7 +3,7 @@ provider: local
 
 registry:
   registry_type: file
-  path: feast/registry/registry.db   # DuckDB file; bind-mounted into api container
+  path: registry/registry.db   # relative to feast/ repo dir; bind-mounted into api container
 
 online_store:
   type: redis

@@ -41,6 +41,14 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
 
   # ─── MinIO (S3-compatible object storage) ───
   minio:
@@ -64,6 +72,14 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
 
   # ─── MinIO bucket initializer (one-shot) ───
   minio-init:
@@ -112,6 +128,14 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 768M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
 
   # ─── MLflow (model registry + experiment tracking) ───
   mlflow:
@@ -144,6 +168,14 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
 
   # ─── Redis Exporter (Prometheus metrics for Redis) ───
   redis-exporter:
@@ -161,6 +193,11 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
 
   # ─── Kafka Exporter (Prometheus metrics for Kafka) ───
   kafka-exporter:
@@ -183,6 +220,11 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
 
   # ─── Prometheus (metrics collection) ───
   prometheus:
@@ -210,6 +252,14 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
 
   # ─── Grafana (dashboards & visualization) ───
   grafana:
@@ -236,6 +286,14 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
 
   # ─── FastAPI (inference serving + training trigger) ───
   api:
@@ -259,6 +317,7 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_S3_ENDPOINT: minio:9000
       # MLflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
@@ -274,6 +333,9 @@ services:
       MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-default}
     volumes:
       - ./feast:/app/feast:ro
+    # /dev/shm shared memory for PyTorch DataLoaders (even with num_workers=0,
+    # some torch ops use shared memory internally)
+    shm_size: 256m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -283,6 +345,14 @@ services:
     restart: unless-stopped
     networks:
       - mlops-network
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 6G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
 
 volumes:
   kafka_data:
