@@ -138,10 +138,34 @@ class Mamba4Rec(nn.Module):
     - Multi-genre embeddings with mean pooling
     - User profile (age, gender, occupation) broadcasted across the sequence
     - Time-of-day embeddings
-    - Positional embeddings
 
-    Fusion:
-        hidden = Item + GenrePool + UserProfile_broadcast + Time + Position
+    Architecture enhancements (v4):
+
+    TUPE (Transformer with Untied Positional Encoding — adapted for GRU/Mamba):
+        Original TUPE separates content and position in attention scores:
+            score = content_score + position_score
+        For GRU/Mamba (no explicit attention), we adapt this by:
+        - Removing pos_emb from the INPUT fusion (content path stays pure)
+        - Injecting positional information as an OUTPUT bias via a separate
+          learned projection: hidden_out = hidden_content + pos_proj(pos_emb)
+        Result: the recurrent backbone learns purely content-driven transitions;
+        position awareness is added as a post-hoc, untied correction.
+
+    SUM Token (causal variant of Prefix Token):
+        A learnable token is APPENDED at the end of each sequence:
+            [0, …, 0, item1, item2, itemN, SUM]   (length = max_seq_len + 1)
+        Because the GRU processes left-to-right, the SUM token at position -1
+        has seen every real item in the history by the time it is read.
+        It acts as a dedicated "next-item query" whose hidden state captures the
+        full sequential context — analogous to [CLS] in BERT but placed at the
+        END to respect causality.
+        User representation = hidden[:, -1, :] = the SUM token's hidden state.
+
+    Combined fusion:
+        content = Item + GenrePool + UserProfile_broadcast + Time   (no pos)
+        hidden  = Mamba(content)
+        hidden  = hidden + pos_proj(pos_emb)                        (TUPE)
+        repr    = hidden[:, -1, :]                                  (SUM token)
     """
 
     def __init__(
@@ -166,29 +190,38 @@ class Mamba4Rec(nn.Module):
         self.num_items = num_items
         self.max_seq_len = max_seq_len
 
-        # Embeddings
-        self.item_embedding = nn.Embedding(num_items, d_model, padding_idx=0)
-        self.genre_embedding = nn.Embedding(num_genres, d_model, padding_idx=0)
-        self.age_embedding = nn.Embedding(num_ages, d_model)
-        self.gender_embedding = nn.Embedding(num_genders, d_model)
+        # ── Content embeddings (no positional — TUPE untied) ──────────────────
+        self.item_embedding       = nn.Embedding(num_items,       d_model, padding_idx=0)
+        self.genre_embedding      = nn.Embedding(num_genres,      d_model, padding_idx=0)
+        self.age_embedding        = nn.Embedding(num_ages,        d_model)
+        self.gender_embedding     = nn.Embedding(num_genders,     d_model)
         self.occupation_embedding = nn.Embedding(num_occupations, d_model)
-        self.time_embedding = nn.Embedding(num_time_slots, d_model)
-        self.position_embedding = nn.Embedding(max_seq_len, d_model)
+        self.time_embedding       = nn.Embedding(num_time_slots,  d_model)
 
-        # Genre Pooling
+        # ── TUPE: position embedding applied AFTER backbone (untied) ─────────
+        # Size = max_seq_len + 1 to cover all item positions (0…max_seq_len-1)
+        # plus the SUM token position (max_seq_len).
+        self.position_embedding = nn.Embedding(max_seq_len + 1, d_model)
+        self.pos_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # ── SUM Token: learnable query token appended at end of sequence ──────
+        # Initialized near zero; model learns to use it as a summary position.
+        self.sum_token = nn.Parameter(torch.zeros(1, 1, d_model))
+
+        # ── Genre Pooling ─────────────────────────────────────────────────────
         self.genre_pooling = GenrePooling(pooling_type="mean")
 
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
+        # ── Dropout ───────────────────────────────────────────────────────────
+        self.dropout    = nn.Dropout(dropout)
         self.emb_dropout = nn.Dropout(dropout)
 
-        # Mamba Backbone
+        # ── Mamba Backbone ────────────────────────────────────────────────────
         self.mamba_layers = nn.ModuleList([
             MambaBlock(d_model, d_state, d_conv, expand)
             for _ in range(n_layers)
         ])
 
-        self.final_norm = nn.LayerNorm(d_model)
+        self.final_norm  = nn.LayerNorm(d_model)
         self.output_proj = nn.Linear(d_model, num_items)
 
         self._init_weights()
@@ -203,6 +236,8 @@ class Mamba4Rec(nn.Module):
                 nn.init.normal_(module.weight, mean=0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        # SUM token: small normal init (same scale as embeddings)
+        nn.init.normal_(self.sum_token, mean=0, std=0.02)
 
     def get_user_profile_embedding(
         self,
@@ -229,55 +264,66 @@ class Mamba4Rec(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            item_seq:    (batch, seq_len)
-            genre_seq:   (batch, seq_len, num_genres)
-            time_seq:    (batch, seq_len)
-            age_idx:     (batch, 1)
-            gender_idx:  (batch, 1)
-            occupation:  (batch, 1)
+            item_seq:      (batch, seq_len)                — left-padded item IDs
+            genre_seq:     (batch, seq_len, num_genres)
+            time_seq:      (batch, seq_len)
+            age_idx:       (batch, 1)
+            gender_idx:    (batch, 1)
+            occupation:    (batch, 1)
             return_hidden: if True, return full hidden states instead of logits
 
         Returns:
-            logits (batch, num_items)  or  hidden (batch, seq_len, d_model)
+            logits (batch, num_items)
+            or hidden (batch, seq_len + 1, d_model)  — +1 for the SUM token
         """
         batch_size, seq_len = item_seq.shape
 
-        item_emb = self.item_embedding(item_seq)                  # (batch, seq, d_model)
-        genre_emb = self.genre_embedding(genre_seq)               # (batch, seq, num_genres, d_model)
-        genre_mask = (genre_seq != 0)
-        genre_pooled = self.genre_pooling(genre_emb, genre_mask)  # (batch, seq, d_model)
-        time_emb = self.time_embedding(time_seq)                  # (batch, seq, d_model)
+        # ── Content embeddings (TUPE: no pos_emb here) ───────────────────────
+        item_emb     = self.item_embedding(item_seq)                   # (B, L, d)
+        genre_emb    = self.genre_embedding(genre_seq)                 # (B, L, G, d)
+        genre_mask   = (genre_seq != 0)
+        genre_pooled = self.genre_pooling(genre_emb, genre_mask)       # (B, L, d)
+        time_emb     = self.time_embedding(time_seq)                   # (B, L, d)
 
-        user_emb = self.get_user_profile_embedding(age_idx, gender_idx, occupation)  # (batch, 1, d_model)
-        user_emb = user_emb.expand(-1, seq_len, -1)
+        user_emb = self.get_user_profile_embedding(age_idx, gender_idx, occupation)
+        user_emb = user_emb.expand(-1, seq_len, -1)                    # (B, L, d)
 
-        positions = torch.arange(seq_len, device=item_seq.device).unsqueeze(0)
-        pos_emb = self.position_embedding(positions)              # (1, seq, d_model)
-
-        hidden = item_emb + genre_pooled + user_emb + time_emb + pos_emb
+        # Pure content fusion — position deliberately excluded (TUPE)
+        hidden = item_emb + genre_pooled + user_emb + time_emb        # (B, L, d)
         hidden = self.emb_dropout(hidden)
 
-        padding_mask = (item_seq != 0).float().unsqueeze(-1)      # (batch, seq, 1)
+        # Zero-out padding positions before the backbone
+        padding_mask = (item_seq != 0).float().unsqueeze(-1)           # (B, L, 1)
         hidden = hidden * padding_mask
 
+        # ── SUM Token: append at end so GRU sees it after all real items ──────
+        sum_tok  = self.sum_token.expand(batch_size, -1, -1)           # (B, 1, d)
+        hidden   = torch.cat([hidden, sum_tok], dim=1)                 # (B, L+1, d)
+
+        # SUM token is always active (never masked)
+        sum_mask  = torch.ones(batch_size, 1, 1, device=item_seq.device)
+        full_mask = torch.cat([padding_mask, sum_mask], dim=1)         # (B, L+1, 1)
+
+        # ── Mamba / GRU backbone ─────────────────────────────────────────────
         for layer in self.mamba_layers:
             hidden = layer(hidden)
-            hidden = hidden * padding_mask
+            hidden = hidden * full_mask
 
-        hidden = self.final_norm(hidden)
+        hidden = self.final_norm(hidden)                               # (B, L+1, d)
+
+        # ── TUPE: inject position bias AFTER backbone (untied from content) ──
+        # Positions 0…L-1 for item slots, position L for the SUM token.
+        positions = torch.arange(seq_len + 1, device=item_seq.device).unsqueeze(0)
+        pos_emb   = self.position_embedding(positions)                 # (1, L+1, d)
+        pos_bias  = self.pos_proj(pos_emb)                            # (1, L+1, d)
+        hidden    = hidden + pos_bias                                  # (B, L+1, d)
 
         if return_hidden:
             return hidden
 
-        # For LEFT-padded sequences [0,…,0, item1,…,itemN] the GRU processes
-        # left-to-right and by position seq_len-1 has seen every real item.
-        # The old seq_lengths = N-1 calculated the count of non-padding tokens
-        # and used it as an index from the START, which landed in the padding
-        # region for short histories (e.g. N=3 → index 2 → still all-zeros).
-        # Fix: always take the last position — correct for any left-padded input.
-        last_hidden = hidden[:, -1, :]                             # (batch, d_model)
-
-        return self.output_proj(last_hidden)                       # (batch, num_items)
+        # SUM token = last position = full-sequence user representation
+        last_hidden = hidden[:, -1, :]                                 # (B, d)
+        return self.output_proj(last_hidden)                           # (B, num_items)
 
     def predict_scores(
         self,
@@ -303,12 +349,11 @@ class Mamba4Rec(nn.Module):
             age_idx, gender_idx, occupation,
             return_hidden=True,
         )
-
-        # Same left-padding fix as forward(): use the last position.
-        last_hidden = hidden[:, -1, :]                             # (batch, d_model)
+        # Last position = SUM token (full-sequence user representation)
+        last_hidden = hidden[:, -1, :]                                 # (batch, d_model)
 
         if candidate_items is not None:
-            candidate_emb = self.item_embedding(candidate_items)   # (batch, num_cand, d_model)
+            candidate_emb = self.item_embedding(candidate_items)       # (batch, num_cand, d_model)
             return torch.bmm(candidate_emb, last_hidden.unsqueeze(-1)).squeeze(-1)
         else:
             return self.output_proj(last_hidden)
