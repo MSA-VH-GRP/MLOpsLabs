@@ -4,10 +4,11 @@ from contextlib import asynccontextmanager
 
 import mlflow
 from fastapi import FastAPI
+from prometheus_client import make_asgi_app
 
-from src.api.metrics import setup_metrics
 from src.api.routers import health, ingest, predict, train
 from src.core.config import settings
+from src.core.metrics import REGISTRY
 
 import logging
 from contextlib import asynccontextmanager
@@ -30,7 +31,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-setup_metrics(app)
+# Expose Prometheus metrics using the SAME registry as custom metrics
+metrics_app = make_asgi_app(registry=REGISTRY)
+app.mount("/metrics", metrics_app)
 
 app.include_router(health.router, tags=["health"])
 app.include_router(ingest.router, tags=["ingest"])

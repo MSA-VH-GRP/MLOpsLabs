@@ -1,3 +1,9 @@
+# Claude Code local state (settings, worktrees, task locks)
+.claude/
+
+# WSL / alternate virtual environments
+.venv-wsl/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

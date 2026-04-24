@@ -32,6 +32,11 @@ def run_training(
     hyperparams: dict,
     feature_view: str,
 ) -> dict:
+    # Mamba4Rec path — delegate to dedicated trainer
+    if model_type == "mamba4rec":
+        from src.training.mamba_trainer import run_mamba_training
+        return run_mamba_training(experiment_name=experiment_name, hyperparams=hyperparams)
+
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     mlflow.set_experiment(experiment_name)
 

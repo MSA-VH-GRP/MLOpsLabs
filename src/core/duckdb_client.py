@@ -104,7 +104,10 @@ def stage_to_parquet(
     """
     Run a DuckDB SQL query and write the result as Parquet to MinIO.
 
-    Uses DuckDB's native COPY TO statement with the httpfs extension.
+    Executes the query via DuckDB (reads from S3 using httpfs), converts to
+    PyArrow in memory, then uploads to MinIO via boto3.  This bypasses DuckDB's
+    own COPY TO S3, which has an httpfs integer-overflow bug in versions ≤ 1.5.x
+    when performing multipart uploads.
 
     Args:
         conn:            DuckDB connection with S3 already configured.
@@ -112,9 +115,31 @@ def stage_to_parquet(
         parquet_s3_path: Destination path on MinIO, e.g.
                          "s3://offline-store/parquet/raw_events/data.parquet"
     """
-    conn.execute(f"""
-        COPY (
-            {query}
-        ) TO '{parquet_s3_path}'
-        (FORMAT PARQUET, OVERWRITE_OR_IGNORE TRUE)
-    """)
+    import io
+
+    import boto3
+    import pyarrow.parquet as pq
+    from botocore.config import Config
+
+    # Execute query → Arrow table (all in memory; uses DuckDB's httpfs for reads)
+    arrow_table = conn.execute(query).arrow().read_all()
+
+    # Serialise to Parquet bytes in memory
+    buf = io.BytesIO()
+    pq.write_table(arrow_table, buf)
+    buf.seek(0)
+
+    # Parse s3://bucket/key
+    without_prefix = parquet_s3_path[len("s3://"):]
+    bucket, _, key = without_prefix.partition("/")
+
+    # Upload via boto3 (path-style, no SSL — same credentials as DuckDB)
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=settings.minio_endpoint,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
