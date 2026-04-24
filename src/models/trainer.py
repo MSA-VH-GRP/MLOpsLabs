@@ -32,6 +32,7 @@ def run_training(
     hyperparams: dict,
     feature_view: str,
 ) -> dict:
+    print(f"Starting training: experiment={experiment_name}, model={model_type}, hyperparams={hyperparams}, feature_view={feature_view}")
     # Mamba4Rec path — delegate to dedicated trainer
     if model_type == "mamba4rec":
         from src.training.mamba_trainer import run_mamba_training

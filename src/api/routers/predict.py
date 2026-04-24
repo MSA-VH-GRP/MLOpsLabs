@@ -10,8 +10,6 @@ import random
 import re
 import time
 
-import mlflow
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Request
 from feast import FeatureStore
 
@@ -22,7 +20,6 @@ from src.api.schemas.predict import (
     PredictRequest,
     PredictResponse,
 )
-from src.core.config import settings
 from src.core.metrics import (
     FEATURE_MISSING_RATE,
     MODEL_INFO,
@@ -36,6 +33,7 @@ from src.core.metrics import (
     SYSTEM_CPU_USAGE,
     SYSTEM_MEMORY_USAGE,
 )
+from src.models.predict import run_predict
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -80,24 +78,19 @@ async def predict(
     t0 = getattr(http_request.state, "predict_start_time", time.perf_counter())
 
     try:
-        entity_rows = [{"event_id": eid} for eid in request.entity_ids]
-        feature_vector = store.get_online_features(
-            features=store.get_feature_service(request.feature_service),
-            entity_rows=entity_rows,
-        ).to_dict()
+        # run_predict: Redis cache-first → DuckDB offline fallback → MLflow model
+        predictions = await asyncio.to_thread(
+            run_predict,
+            store,
+            request.entity_ids,
+            request.feature_service,
+            request.model_name,
+            request.model_alias,
+        )
 
-        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-        model_uri = f"models:/{request.model_name}@{request.model_alias}"
-        model = mlflow.pyfunc.load_model(model_uri)
-
-        df = pd.DataFrame(feature_vector)
-        raw_preds = model.predict(df)
-
-        predictions = []
-        for eid, pred in zip(request.entity_ids, raw_preds):
-            predictions.append({"entity_id": eid, "prediction": pred})
+        for item in predictions:
             try:
-                rating = int(round(float(pred)))
+                rating = int(round(float(item["prediction"])))
                 rating = max(1, min(5, rating))
                 PREDICTION_RATING_TOTAL.labels(rating=str(rating)).inc()
             except Exception:
@@ -136,9 +129,26 @@ async def predict(
         raise HTTPException(status_code=500, detail="Prediction failed")
 
 
+def _check_model_exists(model_name: str, model_alias: str) -> None:
+    """Raise 404 if the MLflow registered model or alias does not exist."""
+    import mlflow
+    from mlflow.exceptions import RestException
+    from src.core.config import settings
+
+    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+    try:
+        mlflow.MlflowClient().get_model_version_by_alias(model_name, model_alias)
+    except RestException:
+        raise HTTPException(
+            status_code=404,
+            detail="Prediction failed — model is not existed.",
+        )
+
+
 @router.post("/predict/mamba", response_model=Mamba4RecPredictResponse)
 async def predict_mamba(request: Mamba4RecPredictRequest):
     _validate_model_ref(request.model_name, request.model_alias)
+    await asyncio.to_thread(_check_model_exists, request.model_name, request.model_alias)
 
     from src.inference.mamba_predictor import get_predictor
 
