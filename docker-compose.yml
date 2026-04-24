@@ -14,13 +14,14 @@ services:
     container_name: mlops-kafka
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       # Fixed cluster ID for reproducible dev setup
       KAFKA_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
@@ -80,6 +81,24 @@ services:
         reservations:
           cpus: "0.25"
           memory: 256M
+
+  # ─── Kafka topic initializer (one-shot) ───
+  kafka-init:
+    image: apache/kafka:4.2.0
+    container_name: mlops-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c",
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic raw-events --partitions 3 --replication-factor 1 &&
+       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic processed-events --partitions 3 --replication-factor 1 &&
+       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic new-user --partitions 3 --replication-factor 1 &&
+       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic new-movie --partitions 3 --replication-factor 1 &&
+       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic new-rating --partitions 3 --replication-factor 1 &&
+       echo 'Kafka topics initialized.'"]
+    networks:
+      - mlops-network
+    restart: "no"
 
   # ─── MinIO bucket initializer (one-shot) ───
   minio-init:
@@ -145,7 +164,7 @@ services:
       minio-init:
         condition: service_completed_successfully
     ports:
-      - "5000:5000"
+      - "5001:5000"
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
@@ -295,6 +314,30 @@ services:
           cpus: "0.1"
           memory: 128M
 
+  # ─── Kafka consumer (Kafka → Delta Lake on MinIO) ───
+  consumer:
+    build:
+      context: .
+      dockerfile: src/api/Dockerfile
+    container_name: mlops-consumer
+    command: ["python", "-m", "src.pipelines.ingest_pipeline"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_INGEST_TOPIC: ${KAFKA_INGEST_TOPIC:-raw-events}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-mlops-consumer-group}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
   # ─── FastAPI (inference serving + training trigger) ───
   api:
     build:
@@ -317,6 +360,7 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_ENDPOINT_URL: http://minio:9000
       AWS_S3_ENDPOINT: minio:9000
       # MLflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
@@ -333,8 +377,6 @@ services:
       MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-default}
     volumes:
       - ./feast:/app/feast:ro
-    # /dev/shm shared memory for PyTorch DataLoaders (even with num_workers=0,
-    # some torch ops use shared memory internally)
     shm_size: 256m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

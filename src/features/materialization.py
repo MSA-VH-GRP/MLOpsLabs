@@ -59,8 +59,8 @@ MAMBA_METADATA_KEY = "parquet/metadata.json"
 OFFLINE_BUCKET = "offline-store"
 
 # S3 paths
-DELTA_PATH = "s3://offline-store/delta/raw_events"
-PARQUET_OUTPUT = "s3://offline-store/parquet/raw_events/staged.parquet"
+DELTA_PATH = "s3://offline-store/delta/train"
+PARQUET_OUTPUT = "s3://offline-store/parquet/users/staged.parquet"
 
 # Storage options for deltalake (boto3 style)
 STORAGE_OPTIONS = {
@@ -75,13 +75,14 @@ STORAGE_OPTIONS = {
 # Extend with any feature engineering needed before materialization.
 STAGING_SQL = """
     SELECT
-        event_id,
+        user_id,
         event_timestamp,
-        CAST(json_extract(payload, '$.feature_1') AS FLOAT)  AS feature_1,
-        CAST(json_extract(payload, '$.feature_2') AS FLOAT)  AS feature_2,
-        CAST(json_extract(payload, '$.category')  AS VARCHAR) AS category,
-        CAST(json_extract(payload, '$.count')     AS BIGINT)  AS count
-    FROM raw_events
+        gender_idx,
+        age_idx,
+        occupation,
+        target,
+        target_time
+    FROM train
     WHERE event_timestamp IS NOT NULL
 """
 
@@ -109,7 +110,7 @@ def delta_to_duckdb_to_parquet() -> int:
 
     row_count = register_delta_as_table(
         conn=conn,
-        table_name="raw_events",
+        table_name="train",
         delta_path=DELTA_PATH,
         storage_options=STORAGE_OPTIONS,
     )

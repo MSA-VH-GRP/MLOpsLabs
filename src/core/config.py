@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     aws_secret_access_key: str = "minioadmin123"
 
     # MLflow
-    mlflow_tracking_uri: str = "http://localhost:5000"
+    mlflow_tracking_uri: str = "http://localhost:5001"
     mlflow_s3_endpoint_url: str = "http://localhost:9000"
     mlflow_experiment_name: str = "default"
 
