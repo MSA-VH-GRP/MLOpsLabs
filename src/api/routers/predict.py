@@ -11,8 +11,8 @@ import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from feast import FeatureStore
 
+from feast import FeatureStore
 from src.api.dependencies import get_feature_store
 from src.api.schemas.predict import (
     Mamba4RecPredictRequest,
@@ -22,14 +22,14 @@ from src.api.schemas.predict import (
 )
 from src.core.metrics import (
     FEATURE_MISSING_RATE,
-    MODEL_INFO,
     MOCK_PREDICTIONS_TOTAL,
-    PREDICTION_DRIFT_SCORE,
-    PREDICTION_RATING_TOTAL,
+    MODEL_INFO,
     PREDICT_BATCH_SIZE,
     PREDICT_ERRORS,
     PREDICT_LATENCY,
     PREDICT_REQUESTS,
+    PREDICTION_DRIFT_SCORE,
+    PREDICTION_RATING_TOTAL,
     SYSTEM_CPU_USAGE,
     SYSTEM_MEMORY_USAGE,
 )
@@ -133,6 +133,7 @@ def _check_model_exists(model_name: str, model_alias: str) -> None:
     """Raise 404 if the MLflow registered model or alias does not exist."""
     import mlflow
     from mlflow.exceptions import RestException
+
     from src.core.config import settings
 
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)

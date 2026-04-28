@@ -18,7 +18,6 @@ import io
 import json
 import logging
 import os
-from typing import Dict, List, Tuple
 
 import boto3
 import pandas as pd
@@ -60,7 +59,7 @@ def _s3_client() -> boto3.client:
 def _read_parquet_prefix(client: boto3.client, bucket: str, prefix: str) -> pd.DataFrame:
     """Read all Parquet files under a bucket/prefix and return as a single DataFrame."""
     paginator = client.get_paginator("list_objects_v2")
-    tables: List[pa.Table] = []
+    tables: list[pa.Table] = []
 
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -88,7 +87,7 @@ def _write_delta(uri: str, df: pd.DataFrame, split_name: str) -> None:
     print(f"  [{split_name}] Written {len(df):>7,} rows → {uri}")
 
 
-def _records_to_df(records: List[Dict]) -> pd.DataFrame:
+def _records_to_df(records: list[dict]) -> pd.DataFrame:
     """Flatten sequence records into a DataFrame for Delta Lake."""
     rows = []
     for r in records:
@@ -137,7 +136,7 @@ class MovieLensPreprocessor:
         self.ratings_df = None
 
     # ── Task 1.3: Load ────────────────────────────────────────────────────────
-    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def load_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Task 1.3: Read raw Parquet files from MinIO raw-data bucket."""
         print(f"Loading MovieLens 1M from MinIO bucket '{RAW_BUCKET}'...")
         client = _s3_client()
@@ -209,7 +208,7 @@ class MovieLensPreprocessor:
         """Task 2.2: Map genres to IDs, pad/truncate to max_genres."""
         movies = self.movies_df.copy()
 
-        def genres_to_ids(genres) -> List[int]:
+        def genres_to_ids(genres) -> list[int]:
             # genres is a list[str] from IngestPipeline (simulate_ingestion splits by |)
             if isinstance(genres, list):
                 genre_list = genres
@@ -263,7 +262,7 @@ class MovieLensPreprocessor:
         movies_df: pd.DataFrame,
         ratings_df: pd.DataFrame,
         min_seq_len: int = 5,
-    ) -> Dict:
+    ) -> dict:
         """Task 2.4: Group ratings per user, sorted by timestamp, filter rating >= 3."""
         print("Building user sequences...")
 
@@ -279,7 +278,7 @@ class MovieLensPreprocessor:
 
         data = data.sort_values(["user_id", "timestamp"])
 
-        sequences: Dict = {}
+        sequences: dict = {}
         for user_id, group in data.groupby("user_id"):
             if len(group) < min_seq_len:
                 continue
@@ -303,9 +302,9 @@ class MovieLensPreprocessor:
     # ── Task 2.5: Leave-one-out split ─────────────────────────────────────────
     def split_sequences(
         self,
-        sequences: Dict,
+        sequences: dict,
         max_seq_len: int = 50,
-    ) -> Tuple[List, List, List]:
+    ) -> tuple[list, list, list]:
         """Task 2.5: Leave-one-out split into train / val / test.
 
         - Test  : last interaction (N)
@@ -370,7 +369,7 @@ class MovieLensPreprocessor:
         return train_data, val_data, test_data
 
     # ── Full pipeline ─────────────────────────────────────────────────────────
-    def process_all(self) -> Tuple[List, List, List, Dict]:
+    def process_all(self) -> tuple[list, list, list, dict]:
         """Run the full preprocessing pipeline end-to-end.
 
         Steps:

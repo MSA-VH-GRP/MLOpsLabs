@@ -2,24 +2,23 @@ import argparse
 import json
 import logging
 import os
-import shutil
 import time
-import zipfile
-from datetime import datetime, timezone
-
 import urllib.request
+import zipfile
+from datetime import UTC, datetime
+
 from confluent_kafka import Producer
 
 # Assume the project root is in python path, or run as `python -m scripts.simulate_ingestion`
 try:
     from src.core.config import settings
-    from src.pipelines.topics import NEW_USER, NEW_MOVIE, NEW_RATING
+    from src.pipelines.topics import NEW_MOVIE, NEW_RATING, NEW_USER
 except ImportError:
     # Fallback if run directly without correct PYTHONPATH
     import sys
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     from src.core.config import settings
-    from src.pipelines.topics import NEW_USER, NEW_MOVIE, NEW_RATING
+    from src.pipelines.topics import NEW_MOVIE, NEW_RATING, NEW_USER
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
@@ -68,7 +67,7 @@ def ingest_users(producer: Producer):
     users_file = os.path.join(DATA_DIR, "users.dat")
     logger.info("Starting ingestion of users...")
     count = 0
-    with open(users_file, "r", encoding="latin-1") as f:
+    with open(users_file, encoding="latin-1") as f:
         for line in f:
             parts = line.strip().split("::")
             if len(parts) != 5:
@@ -76,7 +75,7 @@ def ingest_users(producer: Producer):
             
             user_data = {
                 "event_type": "new_user",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "user_id": int(parts[0]),
                 "gender": parts[1],
                 "age": int(parts[2]),
@@ -101,7 +100,7 @@ def ingest_movies(producer: Producer):
     movies_file = os.path.join(DATA_DIR, "movies.dat")
     logger.info("Starting ingestion of movies...")
     count = 0
-    with open(movies_file, "r", encoding="latin-1") as f:
+    with open(movies_file, encoding="latin-1") as f:
         for line in f:
             parts = line.strip().split("::")
             if len(parts) != 3:
@@ -109,7 +108,7 @@ def ingest_movies(producer: Producer):
             
             movie_data = {
                 "event_type": "new_movie",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "movie_id": int(parts[0]),
                 "title": parts[1],
                 "genres": parts[2].split("|")
@@ -133,7 +132,7 @@ def ingest_ratings(producer: Producer, speedup: float):
     logger.info("Loading and sorting ratings...")
     
     ratings = []
-    with open(ratings_file, "r", encoding="latin-1") as f:
+    with open(ratings_file, encoding="latin-1") as f:
         for line in f:
             parts = line.strip().split("::")
             if len(parts) != 4:
@@ -168,11 +167,11 @@ def ingest_ratings(producer: Producer, speedup: float):
         if actual_elapsed < simulated_elapsed:
             time.sleep(simulated_elapsed - actual_elapsed)
             
-        r["timestamp"] = datetime.now(timezone.utc).isoformat()
+        r["timestamp"] = datetime.now(UTC).isoformat()
         
         producer.produce(
             NEW_RATING,
-            key=f"{r['user_id']}-{r['movie_id']}".encode("utf-8"),
+            key=f"{r['user_id']}-{r['movie_id']}".encode(),
             value=json.dumps(r).encode("utf-8"),
             callback=delivery_report
         )

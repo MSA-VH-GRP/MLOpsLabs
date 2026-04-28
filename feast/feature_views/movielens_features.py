@@ -21,8 +21,9 @@ Data lineage:
 
 from datetime import timedelta
 
+from feast.types import Float32, Int64
+
 from feast import Entity, FeatureView, Field, FileSource
-from feast.types import Float32, Int64, String
 
 # ── Entities ─────────────────────────────────────────────────────────────────
 

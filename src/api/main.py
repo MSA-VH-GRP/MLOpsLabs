@@ -1,5 +1,6 @@
 """FastAPI application factory."""
 
+import logging
 from contextlib import asynccontextmanager
 
 import mlflow
@@ -9,9 +10,6 @@ from prometheus_client import make_asgi_app
 from src.api.routers import health, ingest, predict, train
 from src.core.config import settings
 from src.core.metrics import REGISTRY
-
-import logging
-from contextlib import asynccontextmanager
 
 logging.basicConfig(
     level=logging.INFO,

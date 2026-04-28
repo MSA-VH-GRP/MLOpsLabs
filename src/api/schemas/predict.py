@@ -1,4 +1,3 @@
-from typing import List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -35,8 +34,8 @@ class Mamba4RecPredictRequest(BaseModel):
     model_alias: str = "champion"
 
     # Ordered watch history (most-recent last)
-    item_history: List[int]     # internal_movie_id values
-    time_history: List[int]     # time slot per item: 0=Matinee, 1=Prime Time, 2=Late Night
+    item_history: list[int]     # internal_movie_id values
+    time_history: list[int]     # time slot per item: 0=Matinee, 1=Prime Time, 2=Late Night
 
     # Encoded user profile (from metadata.json mappings)
     age_idx:    int = 0   # 0–6 (seven ML-1M age groups)
@@ -55,6 +54,6 @@ class Mamba4RecPredictRequest(BaseModel):
 class Mamba4RecPredictResponse(BaseModel):
     """Response schema for POST /predict/mamba."""
 
-    recommendations: List[dict]   # [{rank, movie_id, title, genres, score, time_slot}]
+    recommendations: list[dict]   # [{rank, movie_id, title, genres, score, time_slot}]
     model_version: str
     latency_ms: float

@@ -6,9 +6,8 @@ from fastapi import APIRouter
 from src.core.cache import ping as redis_ping
 from src.core.config import settings
 from src.core.kafka_producer import get_producer
-from src.core.storage import get_s3_client
-
 from src.core.metrics import HEALTH_STATUS
+from src.core.storage import get_s3_client
 
 router = APIRouter()
 

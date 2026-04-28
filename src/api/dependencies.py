@@ -3,8 +3,8 @@
 from functools import lru_cache
 
 import mlflow
-from feast import FeatureStore
 
+from feast import FeatureStore
 from src.core.cache import get_redis
 from src.core.config import settings
 from src.core.kafka_producer import get_producer
