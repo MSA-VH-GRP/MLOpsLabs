@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml .
 # Install CPU-only torch first from the PyTorch index (avoids downloading 2GB CUDA wheels)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir "feast[duckdb]"
 
 COPY src/ ./src/
 COPY feast/ ./feast/

@@ -90,7 +90,7 @@ def register_delta_as_table(
 
     _validate_identifier(table_name)
     dt = DeltaTable(delta_path, storage_options=storage_options)
-    arrow_table = dt.to_pyarrow()
+    arrow_table = dt.to_pyarrow_table()
     conn.register(table_name, arrow_table)
     row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
     return row_count

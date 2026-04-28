@@ -6,15 +6,19 @@ import logging
 
 import mlflow
 import mlflow.sklearn
-import pandas as pd
-from feast import FeatureStore
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
 from src.core.config import settings
+from src.core.duckdb_client import get_duckdb_connection
+from src.features.materialization import _set_aws_env
 
 logger = logging.getLogger(__name__)
+
+PARQUET_PATH = "s3://offline-store/parquet/users/staged.parquet"
+FEATURE_COLS = ["gender_idx", "age_idx", "occupation", "target_time"]
+TARGET_COL   = "target"
 
 MODEL_REGISTRY = {
     "random_forest": RandomForestClassifier,
@@ -28,6 +32,7 @@ def run_training(
     hyperparams: dict,
     feature_view: str,
 ) -> dict:
+    print(f"Starting training: experiment={experiment_name}, model={model_type}, hyperparams={hyperparams}, feature_view={feature_view}")
     # Mamba4Rec path — delegate to dedicated trainer
     if model_type == "mamba4rec":
         from src.training.mamba_trainer import run_mamba_training
@@ -36,39 +41,29 @@ def run_training(
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     mlflow.set_experiment(experiment_name)
 
-    store = FeatureStore(repo_path="feast/")
+    _set_aws_env()
 
-    # Build entity_df from the staged offline Parquet (all event_id + event_timestamp pairs)
-    from src.core.duckdb_client import get_duckdb_connection
-    _conn = get_duckdb_connection()
+    conn = get_duckdb_connection()
     try:
-        entity_df = _conn.execute(
-            "SELECT event_id, event_timestamp "
-            "FROM read_parquet('s3://offline-store/parquet/raw_events/staged.parquet')"
+        feature_df = conn.execute(
+            f"SELECT user_id, {', '.join(FEATURE_COLS)}, {TARGET_COL} "
+            f"FROM read_parquet('{PARQUET_PATH}')"
         ).df()
     finally:
-        _conn.close()
-
-    if entity_df.empty:
-        raise ValueError("No entities found in offline store — run materialization first.")
-
-    feature_df = store.get_historical_features(
-        entity_df=entity_df,
-        features=[f"{feature_view}:feature_1", f"{feature_view}:feature_2"],
-    ).to_df()
+        conn.close()
 
     if feature_df.empty:
-        raise ValueError("No training data returned from Feast offline store.")
+        raise ValueError("No training data found — run materialization first.")
 
-    X = feature_df.drop(columns=["event_id", "event_timestamp", "label"], errors="ignore")
-    y = feature_df.get("label", pd.Series([0] * len(feature_df)))
-
+    X = feature_df[FEATURE_COLS]
+    y = feature_df[TARGET_COL]
+    logger.info("Fetched training data: %d rows, features=%s", len(feature_df), FEATURE_COLS)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     model_cls = MODEL_REGISTRY.get(model_type, RandomForestClassifier)
 
     with mlflow.start_run() as run:
-        mlflow.log_params({"model_type": model_type, **hyperparams})
+        mlflow.log_params({"model_type": model_type, "feature_view": feature_view, **hyperparams})
         model = model_cls(**hyperparams)
         model.fit(X_train, y_train)
         score = model.score(X_test, y_test)
