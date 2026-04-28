@@ -1,0 +1,49 @@
+# ── Core API ──────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+
+# ── Feature Store ─────────────────────────────────────────────────────
+feast>=0.50.0
+duckdb>=1.2.0
+ibis-framework[duckdb]>=9.0.0
+
+# ── Storage / Delta Lake ──────────────────────────────────────────────
+deltalake>=0.25.0
+pyarrow>=14.0.0
+boto3>=1.37.0
+
+# ── Messaging ─────────────────────────────────────────────────────────
+confluent-kafka>=2.8.0
+
+# ── Model Registry ────────────────────────────────────────────────────
+mlflow>=3.1.0
+
+# ── Online Store / Cache ──────────────────────────────────────────────
+redis>=5.2.0
+
+# ── HTTP Client ───────────────────────────────────────────────────────
+httpx>=0.28.0
+
+# ── Monitoring ────────────────────────────────────────────────────────
+prometheus-fastapi-instrumentator>=7.1.0
+prometheus-client>=0.21.0
+
+# ── Data / ML ─────────────────────────────────────────────────────────
+pandas>=2.2.0
+scikit-learn>=1.6.0
+numpy>=1.22.0
+
+# ── Deep Learning (Mamba4Rec — CPU build) ────────────────────────────
+# Install GPU build separately: pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2.0
+tqdm>=4.66.0
+pyyaml>=6.0.0
+
+# ── Optional: GPU-accelerated Mamba SSM kernel ───────────────────────
+# Requires CUDA. Uncomment only when a GPU is available:
+# mamba-ssm>=1.2.0
+
+# ── Dev / Test ────────────────────────────────────────────────────────
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
