@@ -84,6 +84,8 @@ known-first-party = ["src"]
 [tool.ruff.lint.per-file-ignores]
 "notebooks/**" = ["F401", "E402", "I001"]
 "tests/**/*.ipynb" = ["F401", "E402", "I001"]
+# sys.path.insert hack splits the import block — isort cannot sort across it
+"tests/unit/test_predict.py" = ["I001", "E402"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
