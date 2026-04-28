@@ -1,4 +1,4 @@
-from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 REGISTRY = CollectorRegistry()
 

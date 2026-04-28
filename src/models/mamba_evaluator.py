@@ -8,17 +8,17 @@ Note: this file is separate from evaluator.py (which has the sklearn accuracy he
 to avoid any naming collision.
 """
 
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Dict, List, Tuple
 
 
 def compute_metrics(
     scores: torch.Tensor,
     k: int = 10,
     target_idx: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute Hit@K, NDCG@K, and MRR@K for one batch.
 
@@ -62,8 +62,8 @@ def evaluate_model(
     model: nn.Module,
     test_loader: DataLoader,
     device: torch.device,
-    ks: List[int] = [5, 10, 20],
-) -> Dict[str, float]:
+    ks: list[int] = [5, 10, 20],
+) -> dict[str, float]:
     """
     Full model evaluation over a candidate-based test loader.
 
@@ -103,7 +103,7 @@ def evaluate_model(
             all_ndcgs[k].append(ndcgs)
             all_mrrs[k].append(mrrs)
 
-    results: Dict[str, float] = {}
+    results: dict[str, float] = {}
     for k in ks:
         results[f"Hit@{k}"]  = torch.cat(all_hits[k]).mean().item()
         results[f"NDCG@{k}"] = torch.cat(all_ndcgs[k]).mean().item()

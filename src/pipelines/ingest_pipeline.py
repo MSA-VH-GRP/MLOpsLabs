@@ -6,13 +6,13 @@ into s3://raw-data/<table_name>/ using the pandas and pyarrow libraries.
 """
 
 import logging
-
 import uuid
+
 import pandas as pd
 
 from src.core.config import settings
 from src.pipelines.consumer import BaseConsumer
-from src.pipelines.topics import RAW_EVENTS, NEW_USER, NEW_MOVIE, NEW_RATING
+from src.pipelines.topics import NEW_MOVIE, NEW_RATING, NEW_USER, RAW_EVENTS
 
 logger = logging.getLogger(__name__)
 

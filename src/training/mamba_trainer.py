@@ -18,8 +18,6 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 
 import ibis
 import mlflow
@@ -27,7 +25,6 @@ import mlflow.pytorch
 import pandas as pd
 import torch
 import torch.nn as nn
-from feast import FeatureStore
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -84,7 +81,7 @@ def _set_aws_env() -> None:
 
 # ─── Helper: load metadata from MinIO ─────────────────────────────────────────
 
-def load_metadata_from_minio() -> Dict:
+def load_metadata_from_minio() -> dict:
     """Download metadata.json from MinIO and return as dict."""
     raw = download_bytes(bucket=OFFLINE_BUCKET, key=METADATA_KEY)
     return json.loads(raw.decode())
@@ -117,7 +114,7 @@ def build_entity_df() -> pd.DataFrame:
 
 # ─── Helper: load movie genres lookup ─────────────────────────────────────────
 
-def load_movie_genre_lookup() -> Dict[int, List[int]]:
+def load_movie_genre_lookup() -> dict[int, list[int]]:
     """
     Read staged movie_features Parquet and return a dict:
         internal_movie_id -> [genre_idx_0, genre_idx_1, genre_idx_2]
@@ -140,11 +137,11 @@ def load_movie_genre_lookup() -> Dict[int, List[int]]:
 
 def build_sequences_and_split(
     feature_df: pd.DataFrame,
-    genre_lookup: Dict[int, List[int]],
+    genre_lookup: dict[int, list[int]],
     max_seq_len: int = 50,
     min_seq_len: int = 5,
     max_train_per_user: int = 15,
-) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Group feature_df by user_id, sort by event_timestamp, and produce
     train / val / test sample lists compatible with SequentialDataset / EvalDataset.
@@ -165,9 +162,9 @@ def build_sequences_and_split(
             "target_time": int,
         }
     """
-    train_data: List[Dict] = []
-    val_data:   List[Dict] = []
-    test_data:  List[Dict] = []
+    train_data: list[dict] = []
+    val_data:   list[dict] = []
+    test_data:  list[dict] = []
 
     grouped = feature_df.sort_values("event_timestamp").groupby("user_id")
 
@@ -286,7 +283,7 @@ class Mamba4RecTrainer:
         return total_loss / len(train_loader)
 
     @torch.no_grad()
-    def validate(self, val_loader: DataLoader) -> Tuple[float, float, float, float]:
+    def validate(self, val_loader: DataLoader) -> tuple[float, float, float, float]:
         """Return (val_loss≈0, hit@10, ndcg@10, mrr@10)."""
         self.model.eval()
         all_hits, all_ndcgs, all_mrrs = [], [], []
@@ -362,7 +359,7 @@ def _patch_feast_duckdb_s3() -> None:
             and data_source.file_format.__class__.__name__ == "DeltaFormat"
         )
         if is_delta:
-            storage_options: Dict = {}
+            storage_options: dict = {}
             if getattr(data_source, "s3_endpoint_override", None):
                 storage_options["AWS_ENDPOINT_URL"] = data_source.s3_endpoint_override
             return ibis.read_delta(path, storage_options=storage_options)
@@ -378,7 +375,7 @@ def _patch_feast_duckdb_s3() -> None:
 
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
-def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
+def run_mamba_training(experiment_name: str, hyperparams: dict) -> dict:
     """
     Full Mamba4Rec training pipeline (called by the dispatcher in trainer.py).
 

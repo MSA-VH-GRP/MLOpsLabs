@@ -1,7 +1,5 @@
 """Unit tests for Pydantic request/response schemas."""
 
-import pytest
-from pydantic import ValidationError
 
 from src.api.schemas.ingest import IngestRequest
 from src.api.schemas.predict import PredictRequest

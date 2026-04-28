@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 from src.api.schemas.train import TrainRequest, TrainResponse
 from src.models.trainer import run_training

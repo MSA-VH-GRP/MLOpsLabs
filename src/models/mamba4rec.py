@@ -10,12 +10,9 @@ Adapted from the original implementation.
 If mamba_ssm is not installed, falls back to a simplified GRU-based implementation.
 """
 
-import math
-from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Try to import mamba_ssm, fall back to simplified implementation if not available
 try:
@@ -104,7 +101,7 @@ class GenrePooling(nn.Module):
         super().__init__()
         self.pooling_type = pooling_type
 
-    def forward(self, genre_emb: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, genre_emb: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             genre_emb: (batch, seq_len, num_genres, dim)
@@ -285,7 +282,7 @@ class Mamba4Rec(nn.Module):
         age_idx: torch.Tensor,
         gender_idx: torch.Tensor,
         occupation: torch.Tensor,
-        candidate_items: Optional[torch.Tensor] = None,
+        candidate_items: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Predict scores for candidate items.
@@ -315,7 +312,7 @@ class Mamba4Rec(nn.Module):
             return self.output_proj(last_hidden)
 
 
-def create_mamba4rec(metadata: Dict, **kwargs) -> Mamba4Rec:
+def create_mamba4rec(metadata: dict, **kwargs) -> Mamba4Rec:
     """Factory — build Mamba4Rec from the metadata dict produced by materialization."""
     return Mamba4Rec(
         num_items=metadata["num_items"],
