@@ -71,13 +71,14 @@ class SequentialDataset(Dataset):
 
         up = sample["user_profile"]
         return {
-            "item_seq": torch.LongTensor(item_seq),
-            "genre_seq": torch.LongTensor(genre_seq),
-            "time_seq": torch.LongTensor(time_seq),
-            "age_idx": torch.LongTensor([up["age_idx"]]),
-            "gender_idx": torch.LongTensor([up["gender_idx"]]),
-            "occupation": torch.LongTensor([up["occupation"]]),
-            "target": torch.LongTensor([sample["target"]]),
+            "item_seq":    torch.LongTensor(item_seq),
+            "genre_seq":   torch.LongTensor(genre_seq),
+            "time_seq":    torch.LongTensor(time_seq),
+            "delta_seq":   torch.LongTensor(self._pad_sequence(sample.get("delta_seq", []), self.max_seq_len)),
+            "age_idx":     torch.LongTensor([up["age_idx"]]),
+            "gender_idx":  torch.LongTensor([up["gender_idx"]]),
+            "occupation":  torch.LongTensor([up["occupation"]]),
+            "target":      torch.LongTensor([sample["target"]]),
             "target_time": torch.LongTensor([sample["target_time"]]),
         }
 
@@ -145,13 +146,14 @@ class EvalDataset(Dataset):
 
         up = sample["user_profile"]
         return {
-            "item_seq": torch.LongTensor(item_seq),
-            "genre_seq": torch.LongTensor(genre_seq),
-            "time_seq": torch.LongTensor(time_seq),
-            "age_idx": torch.LongTensor([up["age_idx"]]),
-            "gender_idx": torch.LongTensor([up["gender_idx"]]),
-            "occupation": torch.LongTensor([up["occupation"]]),
-            "candidates": torch.LongTensor(sample["candidates"]),
+            "item_seq":    torch.LongTensor(item_seq),
+            "genre_seq":   torch.LongTensor(genre_seq),
+            "time_seq":    torch.LongTensor(time_seq),
+            "delta_seq":   torch.LongTensor(self._pad_sequence(sample.get("delta_seq", []), self.max_seq_len)),
+            "age_idx":     torch.LongTensor([up["age_idx"]]),
+            "gender_idx":  torch.LongTensor([up["gender_idx"]]),
+            "occupation":  torch.LongTensor([up["occupation"]]),
+            "candidates":  torch.LongTensor(sample["candidates"]),
             "target_time": torch.LongTensor([sample["target_time"]]),
         }
 

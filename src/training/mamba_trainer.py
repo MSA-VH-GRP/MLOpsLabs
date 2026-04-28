@@ -16,6 +16,7 @@ Data flow inside run_mamba_training():
 
 import json
 import logging
+import math
 import os
 import tempfile
 from datetime import datetime
@@ -29,7 +30,7 @@ import torch
 import torch.nn as nn
 from feast import FeatureStore
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -48,26 +49,59 @@ METADATA_KEY = "parquet/metadata.json"
 # Default hyperparameters  (v2 — optimised)
 DEFAULTS = {
     # ── Model architecture ────────────────────────────────────────────────────
-    # d_model=64 keeps GRU inner dim=128 (fast on CPU). Adding n_layers=3 gives
-    # depth for free: only +50% compute per step vs the original 2-layer model.
+    # v5 fix: pack_padded_sequence + masked TUPE pos_bias (see mamba4rec.py)
     "d_model":              64,
     "d_state":              16,
-    "n_layers":              3,   # was 2   — deeper stack (cheap extra capacity)
+    "n_layers":              3,
     "d_conv":                4,
     "expand":                2,
-    "dropout":             0.2,   # was 0.1 — more regularisation
+    "dropout":             0.3,   # v5: increased from 0.2 — more regularisation
     "max_seq_len":          50,
     # ── Training ──────────────────────────────────────────────────────────────
-    "batch_size":          256,   # was 128 — halves step count; more stable gradients
-    "learning_rate":      5e-4,   # was 1e-3 — previous run peaked at ep 2; slower LR
-    "weight_decay":       1e-2,   # was 1e-4 — stronger L2 regularisation
+    "batch_size":          128,   # v5: smaller batch — more gradient updates per epoch
+    "learning_rate":      2e-4,   # v5: lower than v4 (5e-4 peaked too early at ep4)
+    "weight_decay":       1e-3,   # v5: lighter L2 (1e-2 was too restrictive)
     "epochs":               50,
-    "patience":             15,   # was 10  — more room to find global optimum
+    "patience":             10,   # v5: tighter patience — stop earlier if no improve
     "min_seq_len":           5,
-    "max_train_per_user":   20,   # was 15  — +33% training signal without OOM risk
+    "max_train_per_user":   20,
     # ── Optimiser extras ──────────────────────────────────────────────────────
-    "label_smoothing":     0.1,   # penalise over-confidence on popular items
-    "warmup_epochs":         5,   # linear warm-up before cosine annealing
+    "label_smoothing":     0.1,
+    "warmup_epochs":        10,   # v5: longer warmup — LR stabilises before decay
+    # ── LR scheduler ──────────────────────────────────────────────────────────
+    # v5: ReduceLROnPlateau instead of aggressive cosine annealing.
+    # LR halves when val NDCG@10 doesn't improve for 3 epochs.
+    "lr_scheduler":       "plateau",   # "plateau" | "cosine"
+    "plateau_patience":      3,        # epochs without improvement before LR halves
+    "plateau_factor":       0.5,       # LR multiplier on plateau
+    "eta_min":            1e-5,        # floor for cosine annealing (if used)
+    # ── Ablation flags ────────────────────────────────────────────────────────
+    # Set to False to isolate the contribution of each architectural component.
+    "use_sum_token":      True,        # learnable SUM token appended at end of seq
+    "use_tupe":           True,        # positional bias injected AFTER backbone
+    # ── Time interval (TiSASRec-style) ────────────────────────────────────────
+    # Consecutive time-gap between interactions, discretised via user-relative
+    # normalisation (floor(Δt / Δt_min)) and clipped to num_time_interval_bins.
+    "use_time_interval":       False,
+    "num_time_interval_bins":  256,    # vocabulary size for interval embeddings
+    # ── User profile fusion mode ──────────────────────────────────────────────
+    # "broadcast"   — user_emb added to input sequence (original behaviour)
+    # "film"        — FiLM scale+shift on last_hidden after backbone
+    # "head"        — simple additive 2-layer MLP head
+    # "gated_head"  — sigmoid-gated MLP head (recommended for Mamba)
+    # "normed_head" — MLP head + LayerNorm
+    # "hybrid"      — light broadcast (alpha) + gated_head at output
+    "user_fusion_mode":        "broadcast",
+    # ── Two-stage training (for head-based fusion modes) ─────────────────────
+    # Stage 1: freeze user_head_proj — backbone learns pure sequential patterns
+    # Stage 2: unfreeze all — head learns to inject user signal
+    "two_stage_training":      False,
+    "stage1_epochs":           20,    # how many epochs to freeze the head projection
+    "stage1_lr":               2e-4,  # LR during stage 1 (backbone-only)
+    # ── Backbone override ─────────────────────────────────────────────────────
+    # force_gru=True forces GRU (SimplifiedMamba) even when mamba_ssm is installed.
+    # Use this for fair GRU vs Mamba comparisons at controlled sequence lengths.
+    "force_gru":               False,
 }
 
 
@@ -138,12 +172,48 @@ def load_movie_genre_lookup() -> Dict[int, List[int]]:
 
 # ─── Helper: build sequences and apply leave-one-out split ────────────────────
 
+def _compute_delta_seq(
+    timestamps: List[int],
+    num_bins: int = 256,
+) -> List[int]:
+    """
+    TiSASRec-style consecutive time-gap encoding.
+
+    For each position i, compute the time elapsed since the previous interaction:
+        raw_delta[i] = timestamps[i] - timestamps[i-1]   (seconds)
+        raw_delta[0] = 0  (no previous interaction)
+
+    Normalise by the user's minimum non-zero gap so the scale is user-relative:
+        delta_norm[i] = floor(raw_delta[i] / min_delta)
+
+    Clip to [0, num_bins - 1] so an Embedding table of size num_bins suffices.
+    Index 0 is reserved for "no previous item" (first position) and for padding.
+    """
+    if len(timestamps) == 0:
+        return []
+
+    raw = [0] + [max(0, timestamps[i] - timestamps[i - 1]) for i in range(1, len(timestamps))]
+
+    non_zero = [d for d in raw if d > 0]
+    min_delta = min(non_zero) if non_zero else 1  # fallback for single-interaction users
+
+    result = []
+    for d in raw:
+        if d == 0:
+            result.append(0)
+        else:
+            idx = int(math.floor(d / min_delta))
+            result.append(min(idx, num_bins - 1))
+    return result
+
+
 def build_sequences_and_split(
     feature_df: pd.DataFrame,
     genre_lookup: Dict[int, List[int]],
     max_seq_len: int = 50,
     min_seq_len: int = 5,
     max_train_per_user: int = 15,
+    num_time_interval_bins: int = 256,
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Group feature_df by user_id, sort by event_timestamp, and produce
@@ -159,6 +229,7 @@ def build_sequences_and_split(
         {
             "item_seq":    List[int],
             "time_seq":    List[int],
+            "delta_seq":   List[int],   # TiSASRec time intervals (0 = pad / no prev)
             "genre_seq":   List[List[int]],
             "user_profile": {"age_idx": int, "gender_idx": int, "occupation": int},
             "target":      int,
@@ -178,6 +249,12 @@ def build_sequences_and_split(
         times = group["time_slot"].astype(int).tolist()
         genres = [genre_lookup.get(item, [0, 0, 0]) for item in items]
 
+        # ── TiSASRec: Unix timestamps → consecutive normalised deltas ──────────
+        # event_timestamp may be tz-aware datetime or int; convert to int seconds.
+        ts_series = pd.to_datetime(group["event_timestamp"], utc=True)
+        unix_ts: List[int] = (ts_series.astype("int64") // 10 ** 9).tolist()
+        deltas = _compute_delta_seq(unix_ts, num_bins=num_time_interval_bins)
+
         # Use the last row's user profile (static, so any row is fine)
         last = group.iloc[-1]
         user_profile = {
@@ -194,6 +271,7 @@ def build_sequences_and_split(
         test_data.append({
             "item_seq":    items[:-1][-max_seq_len:],
             "time_seq":    times[:-1][-max_seq_len:],
+            "delta_seq":   deltas[:-1][-max_seq_len:],
             "genre_seq":   genres[:-1][-max_seq_len:],
             "user_profile": user_profile,
             "target":       items[-1],
@@ -205,6 +283,7 @@ def build_sequences_and_split(
             val_data.append({
                 "item_seq":    items[:-2][-max_seq_len:],
                 "time_seq":    times[:-2][-max_seq_len:],
+                "delta_seq":   deltas[:-2][-max_seq_len:],
                 "genre_seq":   genres[:-2][-max_seq_len:],
                 "user_profile": user_profile,
                 "target":       items[-2],
@@ -218,6 +297,7 @@ def build_sequences_and_split(
         train_items  = items[:-2]
         train_times  = times[:-2]
         train_genres = genres[:-2]
+        train_deltas = deltas[:-2]
 
         # Only generate samples for the last max_train_per_user target positions
         start_pos = max(1, len(train_items) - max_train_per_user)
@@ -225,6 +305,7 @@ def build_sequences_and_split(
             train_data.append({
                 "item_seq":    train_items[max(0, i - max_seq_len):i],
                 "time_seq":    train_times[max(0, i - max_seq_len):i],
+                "delta_seq":   train_deltas[max(0, i - max_seq_len):i],
                 "genre_seq":   train_genres[max(0, i - max_seq_len):i],
                 "user_profile": user_profile,
                 "target":       train_items[i],
@@ -268,13 +349,17 @@ class Mamba4RecTrainer:
             item_seq   = batch["item_seq"].to(self.device)
             genre_seq  = batch["genre_seq"].to(self.device)
             time_seq   = batch["time_seq"].to(self.device)
+            delta_seq  = batch["delta_seq"].to(self.device) if "delta_seq" in batch else None
             age_idx    = batch["age_idx"].to(self.device)
             gender_idx = batch["gender_idx"].to(self.device)
             occupation = batch["occupation"].to(self.device)
             target     = batch["target"].squeeze(-1).to(self.device)
 
             self.optimizer.zero_grad()
-            logits = self.model(item_seq, genre_seq, time_seq, age_idx, gender_idx, occupation)
+            logits = self.model(
+                item_seq, genre_seq, time_seq, age_idx, gender_idx, occupation,
+                delta_seq=delta_seq,
+            )
             loss = self.criterion(logits, target)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -295,6 +380,7 @@ class Mamba4RecTrainer:
             item_seq   = batch["item_seq"].to(self.device)
             genre_seq  = batch["genre_seq"].to(self.device)
             time_seq   = batch["time_seq"].to(self.device)
+            delta_seq  = batch["delta_seq"].to(self.device) if "delta_seq" in batch else None
             age_idx    = batch["age_idx"].to(self.device)
             gender_idx = batch["gender_idx"].to(self.device)
             occupation = batch["occupation"].to(self.device)
@@ -303,6 +389,7 @@ class Mamba4RecTrainer:
             scores = self.model.predict_scores(
                 item_seq, genre_seq, time_seq, age_idx, gender_idx, occupation,
                 candidate_items=candidates,
+                delta_seq=delta_seq,
             )
             hit, ndcg, mrr = compute_metrics(scores, k=10)
             all_hits.append(hit)
@@ -465,6 +552,7 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
         max_seq_len=hp["max_seq_len"],
         min_seq_len=hp["min_seq_len"],
         max_train_per_user=hp["max_train_per_user"],
+        num_time_interval_bins=hp.get("num_time_interval_bins", 256),
     )
 
     # ── Step 5: Create DataLoaders ────────────────────────────────────────────
@@ -505,9 +593,21 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
             "max_train_per_user":   hp["max_train_per_user"],
             "label_smoothing":      hp["label_smoothing"],
             "warmup_epochs":        hp["warmup_epochs"],
+            "lr_scheduler":         hp.get("lr_scheduler", "cosine"),
+            "plateau_patience":     hp.get("plateau_patience", 3),
+            "plateau_factor":       hp.get("plateau_factor", 0.5),
+            "eta_min":              hp.get("eta_min", 1e-5),
             "num_items":            metadata["num_items"],
             "num_genres":           metadata["num_genres"],
             "mamba_ssm_available":  MAMBA_AVAILABLE,
+            "use_sum_token":           hp.get("use_sum_token", True),
+            "use_tupe":                hp.get("use_tupe", True),
+            "use_time_interval":       hp.get("use_time_interval", False),
+            "num_time_interval_bins":  hp.get("num_time_interval_bins", 256),
+            "user_fusion_mode":        hp.get("user_fusion_mode", "broadcast"),
+            "two_stage_training":      hp.get("two_stage_training", False),
+            "stage1_epochs":           hp.get("stage1_epochs", 20),
+            "force_gru":               hp.get("force_gru", False),
         })
 
         # Instantiate model
@@ -520,6 +620,12 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
             expand=hp["expand"],
             dropout=hp["dropout"],
             max_seq_len=hp["max_seq_len"],
+            use_sum_token=hp.get("use_sum_token", True),
+            use_tupe=hp.get("use_tupe", True),
+            use_time_interval=hp.get("use_time_interval", False),
+            num_time_interval_bins=hp.get("num_time_interval_bins", 256),
+            user_fusion_mode=hp.get("user_fusion_mode", "broadcast"),
+            force_gru=hp.get("force_gru", False),
         )
 
         trainer = Mamba4RecTrainer(
@@ -530,9 +636,13 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
             label_smoothing=hp["label_smoothing"],
         )
 
-        # Linear warm-up for warmup_epochs, then cosine annealing to eta_min.
-        # Warmup prevents large gradient steps in the early phase (which caused
-        # the previous run to peak at epoch 2 and then plateau).
+        # v5 LR schedule:
+        #   Phase 1: Linear warmup for warmup_epochs (LR: 0.1x → 1.0x)
+        #   Phase 2 (plateau):   ReduceLROnPlateau — halves LR when val NDCG
+        #                        stagnates for plateau_patience epochs.
+        #   Phase 2 (cosine):    CosineAnnealingLR from peak LR down to eta_min.
+        # ReduceLROnPlateau is preferred: it adapts to the training dynamics
+        # rather than decaying on a fixed schedule that may overshoot.
         warmup_epochs = max(1, hp["warmup_epochs"])
         warmup_sched = LinearLR(
             trainer.optimizer,
@@ -540,22 +650,54 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
             end_factor=1.0,
             total_iters=warmup_epochs,
         )
-        cosine_sched = CosineAnnealingLR(
-            trainer.optimizer,
-            T_max=max(1, hp["epochs"] - warmup_epochs),
-            eta_min=1e-6,
-        )
-        scheduler = SequentialLR(
-            trainer.optimizer,
-            schedulers=[warmup_sched, cosine_sched],
-            milestones=[warmup_epochs],
-        )
+
+        use_plateau = hp.get("lr_scheduler", "plateau") == "plateau"
+        if use_plateau:
+            # ReduceLROnPlateau monitors val NDCG; step() called with the metric
+            post_warmup_sched = ReduceLROnPlateau(
+                trainer.optimizer,
+                mode="max",
+                factor=hp.get("plateau_factor", 0.5),
+                patience=hp.get("plateau_patience", 3),
+                min_lr=hp.get("eta_min", 1e-5),
+            )
+        else:
+            post_warmup_sched = CosineAnnealingLR(
+                trainer.optimizer,
+                T_max=max(1, hp["epochs"] - warmup_epochs),
+                eta_min=hp.get("eta_min", 1e-5),
+            )
 
         best_ndcg = 0.0
         patience_counter = 0
         best_model_state = None
 
+        # ── Two-stage training setup ──────────────────────────────────────────
+        # Stage 1: freeze head projection so backbone learns uncontaminated
+        #          sequential patterns. Stage 2: unfreeze and fine-tune together.
+        _HEAD_PARAM_KEYS = ("user_head_proj", "user_gate", "user_head_norm", "hybrid_alpha")
+        two_stage = (
+            hp.get("two_stage_training", False)
+            and hp.get("user_fusion_mode", "broadcast") in
+                ("head", "gated_head", "normed_head", "hybrid")
+        )
+        stage1_epochs = hp.get("stage1_epochs", 20)
+        _in_stage1 = False  # tracks whether we toggled param groups this epoch
+
+        def _set_head_frozen(frozen: bool) -> None:
+            for name, param in model.named_parameters():
+                if any(k in name for k in _HEAD_PARAM_KEYS):
+                    param.requires_grad = not frozen
+
+        if two_stage:
+            _set_head_frozen(True)
+            logger.info("Two-stage training: Stage 1 — backbone-only for %d epochs", stage1_epochs)
+
         for epoch in range(hp["epochs"]):
+            # Transition from Stage 1 → Stage 2
+            if two_stage and epoch == stage1_epochs:
+                _set_head_frozen(False)
+                logger.info("Two-stage training: Stage 2 — all params unfrozen at epoch %d", epoch + 1)
             logger.info("Epoch %d/%d", epoch + 1, hp["epochs"])
 
             train_loss = trainer.train_epoch(train_loader)
@@ -567,16 +709,25 @@ def run_mamba_training(experiment_name: str, hyperparams: Dict) -> Dict:
                     "val_hit_at_10":  hit10,
                     "val_ndcg_at_10": ndcg10,
                     "val_mrr_at_10":  mrr10,
+                    "learning_rate":  trainer.optimizer.param_groups[0]["lr"],
                 },
                 step=epoch,
             )
 
             logger.info(
-                "Epoch %d — loss=%.4f  hit@10=%.4f  ndcg@10=%.4f  mrr@10=%.4f",
+                "Epoch %d — loss=%.4f  hit@10=%.4f  ndcg@10=%.4f  mrr@10=%.4f  lr=%.2e",
                 epoch + 1, train_loss, hit10, ndcg10, mrr10,
+                trainer.optimizer.param_groups[0]["lr"],
             )
 
-            scheduler.step()
+            # Step schedulers
+            if epoch < warmup_epochs:
+                warmup_sched.step()
+            else:
+                if use_plateau:
+                    post_warmup_sched.step(ndcg10)   # plateau monitors val NDCG
+                else:
+                    post_warmup_sched.step()
 
             if ndcg10 > best_ndcg:
                 best_ndcg = ndcg10

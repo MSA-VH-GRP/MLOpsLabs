@@ -86,6 +86,7 @@ def evaluate_model(
         item_seq    = batch["item_seq"].to(device)
         genre_seq   = batch["genre_seq"].to(device)
         time_seq    = batch["time_seq"].to(device)
+        delta_seq   = batch["delta_seq"].to(device) if "delta_seq" in batch else None
         age_idx     = batch["age_idx"].to(device)
         gender_idx  = batch["gender_idx"].to(device)
         occupation  = batch["occupation"].to(device)
@@ -95,6 +96,7 @@ def evaluate_model(
             item_seq, genre_seq, time_seq,
             age_idx, gender_idx, occupation,
             candidate_items=candidates,
+            delta_seq=delta_seq,
         )
 
         for k in ks:
