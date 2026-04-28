@@ -266,11 +266,13 @@ class Mamba4Rec(nn.Module):
         if return_hidden:
             return hidden
 
-        # Use the last valid (non-padding) position
-        seq_lengths = (item_seq != 0).sum(dim=1) - 1
-        seq_lengths = seq_lengths.clamp(min=0)
-        batch_indices = torch.arange(batch_size, device=item_seq.device)
-        last_hidden = hidden[batch_indices, seq_lengths]           # (batch, d_model)
+        # For LEFT-padded sequences [0,…,0, item1,…,itemN] the GRU processes
+        # left-to-right and by position seq_len-1 has seen every real item.
+        # The old seq_lengths = N-1 calculated the count of non-padding tokens
+        # and used it as an index from the START, which landed in the padding
+        # region for short histories (e.g. N=3 → index 2 → still all-zeros).
+        # Fix: always take the last position — correct for any left-padded input.
+        last_hidden = hidden[:, -1, :]                             # (batch, d_model)
 
         return self.output_proj(last_hidden)                       # (batch, num_items)
 
@@ -299,11 +301,8 @@ class Mamba4Rec(nn.Module):
             return_hidden=True,
         )
 
-        batch_size = item_seq.shape[0]
-        seq_lengths = (item_seq != 0).sum(dim=1) - 1
-        seq_lengths = seq_lengths.clamp(min=0)
-        batch_indices = torch.arange(batch_size, device=item_seq.device)
-        last_hidden = hidden[batch_indices, seq_lengths]           # (batch, d_model)
+        # Same left-padding fix as forward(): use the last position.
+        last_hidden = hidden[:, -1, :]                             # (batch, d_model)
 
         if candidate_items is not None:
             candidate_emb = self.item_embedding(candidate_items)   # (batch, num_cand, d_model)
