@@ -8,9 +8,7 @@ Usage:
 
 import json
 import logging
-import os
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import mlflow
 import mlflow.pytorch
@@ -40,8 +38,8 @@ class MambaPredictor:
     def __init__(
         self,
         model: torch.nn.Module,
-        metadata: Dict,
-        movies_info: List[Dict],
+        metadata: dict,
+        movies_info: list[dict],
         device: torch.device,
     ):
         self.model = model
@@ -50,8 +48,8 @@ class MambaPredictor:
         self.device = device
 
         # Build lookup: original movie_id → title / genres
-        self.movie_title: Dict[int, str] = {}
-        self.movie_genres: Dict[int, str] = {}
+        self.movie_title: dict[int, str] = {}
+        self.movie_genres: dict[int, str] = {}
         for row in movies_info:
             mid = int(row["movie_id"])
             self.movie_title[mid]  = row.get("title", f"Movie {mid}")
@@ -59,7 +57,7 @@ class MambaPredictor:
             self.movie_genres[mid] = "|".join(genres) if isinstance(genres, list) else str(genres)
 
         # reverse_movie_map: internal_id (str key) → original_movie_id
-        self.reverse_movie_map: Dict[int, int] = {
+        self.reverse_movie_map: dict[int, int] = {
             int(k): int(v) for k, v in metadata.get("reverse_movie_map", {}).items()
         }
 
@@ -99,7 +97,7 @@ class MambaPredictor:
         with open(artifacts_path / "metadata.json", encoding="utf-8") as f:
             metadata = json.load(f)
 
-        movies_info: List[Dict] = []
+        movies_info: list[dict] = []
         movies_info_path = artifacts_path / "movies_info.json"
         if movies_info_path.exists():
             with open(movies_info_path, encoding="utf-8") as f:
@@ -113,11 +111,11 @@ class MambaPredictor:
 
     def _prepare_input(
         self,
-        item_history: List[int],
-        time_history: List[int],
-        genre_lookup: Optional[Dict[int, List[int]]] = None,
+        item_history: list[int],
+        time_history: list[int],
+        genre_lookup: dict[int, list[int]] | None = None,
         max_seq_len: int = 50,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """
         Pad sequences and build the model input dict.
 
@@ -149,15 +147,15 @@ class MambaPredictor:
     @torch.no_grad()
     def recommend(
         self,
-        item_history: List[int],
-        time_history: List[int],
+        item_history: list[int],
+        time_history: list[int],
         age_idx: int,
         gender_idx: int,
         occupation: int,
         top_k: int = 10,
         target_time: int = 1,
         now_showing_only: bool = False,
-    ) -> List[Dict]:
+    ) -> list[dict]:
         """
         Return top-K movie recommendations.
 
@@ -227,7 +225,7 @@ class MambaPredictor:
 
 # ── Module-level cache: keyed by (model_name, alias) ──────────────────────────
 
-_predictor_cache: Dict[tuple, MambaPredictor] = {}
+_predictor_cache: dict[tuple, MambaPredictor] = {}
 
 
 def get_predictor(model_name: str = "mamba4rec", alias: str = "champion") -> MambaPredictor:

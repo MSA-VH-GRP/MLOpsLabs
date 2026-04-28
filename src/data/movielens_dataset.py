@@ -21,10 +21,10 @@ Each sample dict has the structure:
 EvalDataset adds a "candidates" field: [target] + 99 randomly-sampled negatives.
 """
 
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from typing import Dict, List, Tuple
 
 
 class SequentialDataset(Dataset):
@@ -32,7 +32,7 @@ class SequentialDataset(Dataset):
 
     def __init__(
         self,
-        data: List[Dict],
+        data: list[dict],
         max_seq_len: int = 50,
         max_genres: int = 3,
     ):
@@ -43,12 +43,12 @@ class SequentialDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def _pad_sequence(self, seq: List, max_len: int, pad_value: int = 0) -> List:
+    def _pad_sequence(self, seq: list, max_len: int, pad_value: int = 0) -> list:
         if len(seq) >= max_len:
             return seq[-max_len:]
         return [pad_value] * (max_len - len(seq)) + seq
 
-    def _pad_genre_sequence(self, genre_seq: List[List[int]]) -> List[List[int]]:
+    def _pad_genre_sequence(self, genre_seq: list[list[int]]) -> list[list[int]]:
         padded = []
         for genres in genre_seq:
             if len(genres) < self.max_genres:
@@ -62,7 +62,7 @@ class SequentialDataset(Dataset):
 
         return padded[-self.max_seq_len :]
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.data[idx]
 
         item_seq = self._pad_sequence(sample["item_seq"], self.max_seq_len)
@@ -87,7 +87,7 @@ class EvalDataset(Dataset):
 
     def __init__(
         self,
-        data: List[Dict],
+        data: list[dict],
         num_items: int,
         num_negatives: int = 99,
         max_seq_len: int = 50,
@@ -106,7 +106,7 @@ class EvalDataset(Dataset):
             history = set(sample["item_seq"])
             target = sample["target"]
 
-            negatives: List[int] = []
+            negatives: list[int] = []
             while len(negatives) < self.num_negatives:
                 neg = np.random.randint(1, self.num_items)
                 if neg not in history and neg != target:
@@ -114,12 +114,12 @@ class EvalDataset(Dataset):
 
             self.eval_data.append({**sample, "candidates": [target] + negatives})
 
-    def _pad_sequence(self, seq: List, max_len: int, pad_value: int = 0) -> List:
+    def _pad_sequence(self, seq: list, max_len: int, pad_value: int = 0) -> list:
         if len(seq) >= max_len:
             return seq[-max_len:]
         return [pad_value] * (max_len - len(seq)) + seq
 
-    def _pad_genre_sequence(self, genre_seq: List[List[int]]) -> List[List[int]]:
+    def _pad_genre_sequence(self, genre_seq: list[list[int]]) -> list[list[int]]:
         padded = []
         for genres in genre_seq:
             if len(genres) < self.max_genres:
@@ -136,7 +136,7 @@ class EvalDataset(Dataset):
     def __len__(self) -> int:
         return len(self.eval_data)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.eval_data[idx]
 
         item_seq = self._pad_sequence(sample["item_seq"], self.max_seq_len)
@@ -157,14 +157,14 @@ class EvalDataset(Dataset):
 
 
 def create_dataloaders(
-    train_data: List[Dict],
-    val_data: List[Dict],
-    test_data: List[Dict],
-    metadata: Dict,
+    train_data: list[dict],
+    val_data: list[dict],
+    test_data: list[dict],
+    metadata: dict,
     batch_size: int = 256,
     num_workers: int = 0,
     max_seq_len: int = 50,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Create train / val / test DataLoaders."""
     max_genres = metadata.get("max_genres_per_item", 3)
     num_items = metadata["num_items"]

@@ -15,8 +15,9 @@ Data lineage:
 
 from datetime import timedelta
 
-from feast import Entity, FeatureView, Field, FileSource
 from feast.types import Int64
+
+from feast import Entity, FeatureView, Field, FileSource
 
 # ── Entity ──────────────────────────────────────────────────────────────────
 user_entity = Entity(
@@ -29,7 +30,7 @@ user_entity = Entity(
 # Source: delta/train → materialization.py STAGING_SQL → this Parquet.
 # S3 credentials are injected via AWS_* environment variables at runtime
 # (set in materialization.py → _set_aws_env()).
-import os
+import os  # noqa: E402
 
 raw_event_source = FileSource(
     path="s3://offline-store/parquet/users/staged.parquet",

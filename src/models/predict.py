@@ -10,8 +10,8 @@ import logging
 
 import mlflow
 import pandas as pd
-from feast import FeatureStore
 
+from feast import FeatureStore
 from src.core.config import settings
 from src.core.duckdb_client import get_duckdb_connection
 

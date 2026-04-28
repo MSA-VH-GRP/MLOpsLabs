@@ -20,11 +20,10 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Dict
 
 import pandas as pd
-from feast import FeatureStore
 
+from feast import FeatureStore
 from src.core.config import settings
 from src.core.duckdb_client import get_duckdb_connection, register_delta_as_table, stage_to_parquet
 from src.core.storage import upload_bytes
@@ -32,7 +31,7 @@ from src.core.storage import upload_bytes
 logger = logging.getLogger(__name__)
 
 # ── MovieLens genre mapping (fixed for ML-1M) ────────────────────────────────
-GENRE_TO_IDX: Dict[str, int] = {
+GENRE_TO_IDX: dict[str, int] = {
     "Action": 1,
     "Adventure": 2,
     "Animation": 3,
@@ -53,7 +52,7 @@ GENRE_TO_IDX: Dict[str, int] = {
     "Western": 18,
 }
 
-AGE_TO_IDX: Dict[int, int] = {1: 0, 18: 1, 25: 2, 35: 3, 45: 4, 50: 5, 56: 6}
+AGE_TO_IDX: dict[int, int] = {1: 0, 18: 1, 25: 2, 35: 3, 45: 4, 50: 5, 56: 6}
 
 MAMBA_METADATA_KEY = "parquet/metadata.json"
 OFFLINE_BUCKET = "offline-store"
@@ -165,7 +164,7 @@ def _encode_genres(genres_list, max_genres: int = 3) -> list:
     return indices
 
 
-def run_movielens_materialization() -> Dict:
+def run_movielens_materialization() -> dict:
     """
     Stage raw MovieLens Parquet files (written by the Kafka ingest pipeline) into
     three Feast-compatible Parquet files and a metadata JSON, all on MinIO.
@@ -270,11 +269,11 @@ def run_movielens_materialization() -> Dict:
     )
 
     # Build movie_id ↔ internal_id maps for metadata
-    movie_id_map: Dict[int, int] = dict(zip(
+    movie_id_map: dict[int, int] = dict(zip(
         movie_df["movie_id"].astype(int),
         movie_df["internal_movie_id"].astype(int),
     ))
-    reverse_movie_map: Dict[int, int] = {v: k for k, v in movie_id_map.items()}
+    reverse_movie_map: dict[int, int] = {v: k for k, v in movie_id_map.items()}
 
     # Also store title information (used at inference)
     movies_info_df = conn.execute(
@@ -308,7 +307,7 @@ def run_movielens_materialization() -> Dict:
     num_users = int(conn.execute("SELECT COUNT(DISTINCT user_id) FROM new_user").fetchone()[0])
     num_occupations = int(conn.execute("SELECT MAX(occupation)+1 FROM new_user").fetchone()[0])
 
-    metadata: Dict = {
+    metadata: dict = {
         "num_items":           len(movie_id_map) + 1,   # +1 for padding idx 0
         "num_genres":          len(GENRE_TO_IDX) + 1,   # +1 for padding idx 0
         "num_ages":            7,

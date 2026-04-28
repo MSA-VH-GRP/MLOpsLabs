@@ -7,7 +7,6 @@ Defines:
 """
 
 from feast import FeatureService
-
 from feature_views.raw_features import raw_event_feature_view
 
 # ── Feature Service ───────────────────────────────────────────────────────────
